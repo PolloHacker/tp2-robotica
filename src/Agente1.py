@@ -840,8 +840,414 @@ class DetectorDeChegada:
         )
 
 
+class CamadaReativa:
+    """Camada reativa dinamica para desvio de obstaculos e navegacao local.
+
+    Combina lookahead no caminho global D* Lite com repulsao por campos
+    potenciais a partir do laser Hokuyo, deteccao e persistencia de obstaculos
+    dinamicos, histerese/expiracao de celulas bloqueadas, quebra de simetria
+    a direita e deteccao/recuperacao de estagnacao (recuo e giro).
+    """
+
+    ESTADO_NORMAL = 0
+    ESTADO_RECUO = 1
+    ESTADO_GIRO = 2
+
+    def __init__(
+        self,
+        *,
+        distancia_lookahead_m: float = 0.60,
+        raio_influencia_laser_m: float = 0.90,
+        distancia_saturacao_m: float = 0.32,
+        ganho_repulsao: float = 0.35,
+        ganho_simetria: float = 0.30,
+        f_rep_max: float = 0.65,
+        angulo_frontal_rad: float = math.radians(30.0),
+        alcance_dinamico_m: float = 3.0,
+        passos_persistencia: int = 3,
+        passos_expiracao: int = 15,
+        janela_estagnacao_passos: int = 20,
+        limiar_deslocamento_estagnacao_m: float = 0.05,
+        limiar_angulo_estagnacao_rad: float = 0.20,
+        passos_recuo: int = 12,
+        passos_giro: int = 10,
+        velocidade_desejada_m_s: float = 0.50,
+        distancia_controle_m: float = 0.20,
+        tolerancia_goal_m: float = 0.10,
+        raio_robo_m: float = 0.26,
+    ) -> None:
+        self.distancia_lookahead_m = float(distancia_lookahead_m)
+        self.raio_influencia_laser_m = float(raio_influencia_laser_m)
+        self.distancia_saturacao_m = float(distancia_saturacao_m)
+        self.ganho_repulsao = float(ganho_repulsao)
+        self.ganho_simetria = float(ganho_simetria)
+        self.f_rep_max = float(f_rep_max)
+        self.angulo_frontal_rad = float(angulo_frontal_rad)
+        self.alcance_dinamico_m = float(alcance_dinamico_m)
+        self.passos_persistencia = int(passos_persistencia)
+        self.passos_expiracao = int(passos_expiracao)
+        self.janela_estagnacao_passos = int(janela_estagnacao_passos)
+        self.limiar_deslocamento_estagnacao_m = float(
+            limiar_deslocamento_estagnacao_m
+        )
+        self.limiar_angulo_estagnacao_rad = float(limiar_angulo_estagnacao_rad)
+        self.passos_recuo = int(passos_recuo)
+        self.passos_giro = int(passos_giro)
+        self.velocidade_desejada_m_s = float(velocidade_desejada_m_s)
+        self.distancia_controle_m = float(distancia_controle_m)
+        self.tolerancia_goal_m = float(tolerancia_goal_m)
+        self.raio_robo_m = float(raio_robo_m)
+
+        # Estado interno de rastreamento de obstaculos dinamicos
+        self._passo_atual = 0
+        self._contagens_persistencia: dict[Cell, int] = {}
+        self._ultimo_passo_visto: dict[Cell, int] = {}
+        self._celulas_bloqueadas: set[Cell] = set()
+
+        # Estado interno de estagnacao e recuperacao
+        self._estado_recuperacao = self.ESTADO_NORMAL
+        self._passos_em_recuperacao = 0
+        self._historico_poses: list[tuple[int, float, float, float]] = []
+
+    def resetar_recuperacao(self) -> None:
+        """Reinicia o monitor de estagnacao e a maquina de recuperacao."""
+        self._estado_recuperacao = self.ESTADO_NORMAL
+        self._passos_em_recuperacao = 0
+        self._historico_poses.clear()
+
+    def resetar_obstaculos_dinamicos(
+        self, planejador: PlanejadorGlobal | None = None
+    ) -> None:
+        """Libera todas as celulas dinamicamente bloqueadas e limpa historico."""
+        if planejador is not None and self._celulas_bloqueadas:
+            planejador.marcar_bloqueio(list(self._celulas_bloqueadas), False)
+        self._celulas_bloqueadas.clear()
+        self._contagens_persistencia.clear()
+        self._ultimo_passo_visto.clear()
+
+    def selecionar_lookahead(
+        self, pose: tuple[float, float, float], caminho: list[WorldPoint]
+    ) -> WorldPoint | None:
+        """Seleciona waypoint a frente no caminho global a distancia de lookahead."""
+        if not caminho:
+            return None
+        if len(caminho) == 1:
+            return caminho[0]
+        xr, yr = float(pose[0]), float(pose[1])
+        idx_mais_proximo = min(
+            range(len(caminho)),
+            key=lambda i: math.hypot(caminho[i][0] - xr, caminho[i][1] - yr),
+        )
+        for i in range(idx_mais_proximo, len(caminho)):
+            dist = math.hypot(caminho[i][0] - xr, caminho[i][1] - yr)
+            if dist >= self.distancia_lookahead_m:
+                return caminho[i]
+        return caminho[-1]
+
+    def calcular_atracao(
+        self, pose: tuple[float, float, float], waypoint: WorldPoint
+    ) -> tuple[float, float]:
+        """Calcula vetor atrativo mundial em direcao ao waypoint de lookahead."""
+        delta_x = float(waypoint[0]) - float(pose[0])
+        delta_y = float(waypoint[1]) - float(pose[1])
+        dist = math.hypot(delta_x, delta_y)
+        if dist < 1e-9:
+            return 0.0, 0.0
+        fator = self.velocidade_desejada_m_s / dist
+        return delta_x * fator, delta_y * fator
+
+    def calcular_repulsao(
+        self, pose: tuple[float, float, float], laser: np.ndarray
+    ) -> tuple[float, float]:
+        """Calcula forca repulsiva resultante por campos potenciais."""
+        if laser is None or len(laser) == 0:
+            return 0.0, 0.0
+        dados = np.asarray(laser, dtype=float)
+        if dados.ndim != 2 or dados.shape[1] < 2:
+            return 0.0, 0.0
+
+        angulos = dados[:, 0]
+        distancias = dados[:, 1]
+        mask = (
+            np.isfinite(angulos)
+            & np.isfinite(distancias)
+            & (distancias > 0.02)
+            & (distancias < self.raio_influencia_laser_m)
+        )
+        if not np.any(mask):
+            return 0.0, 0.0
+
+        angulos_validos = angulos[mask]
+        dist_validas = distancias[mask]
+
+        # Agrupamento em setores angulares para evitar viés de contagem de feixes
+        num_setores = 24
+        ang_min, ang_max = -math.radians(120.0), math.radians(120.0)
+        largura_setor = (ang_max - ang_min) / num_setores
+
+        setor_indices = np.clip(
+            np.floor((angulos_validos - ang_min) / largura_setor).astype(int),
+            0,
+            num_setores - 1,
+        )
+
+        theta = float(pose[2])
+        fx_total, fy_total = 0.0, 0.0
+
+        for s in range(num_setores):
+            em_setor = setor_indices == s
+            if not np.any(em_setor):
+                continue
+            idx_min = np.argmin(dist_validas[em_setor])
+            d_min = float(dist_validas[em_setor][idx_min])
+            ang_obs = float(angulos_validos[em_setor][idx_min])
+
+            d_efetiva = max(d_min, self.distancia_saturacao_m)
+            magnitude = (
+                self.ganho_repulsao
+                * (
+                    (1.0 / d_efetiva)
+                    - (1.0 / self.raio_influencia_laser_m)
+                )
+                * (1.0 / d_efetiva)
+            )
+
+            phi = theta + ang_obs
+            fx_total += -magnitude * math.cos(phi)
+            fy_total += -magnitude * math.sin(phi)
+
+        norma = math.hypot(fx_total, fy_total)
+        if norma > self.f_rep_max and norma > 1e-9:
+            escala = self.f_rep_max / norma
+            fx_total *= escala
+            fy_total *= escala
+
+        return fx_total, fy_total
+
+    def calcular_quebra_simetria(
+        self, pose: tuple[float, float, float], laser: np.ndarray
+    ) -> tuple[float, float]:
+        """Aplica regra deterministica de desvio a direita em encontro frontal."""
+        if laser is None or len(laser) == 0:
+            return 0.0, 0.0
+        dados = np.asarray(laser, dtype=float)
+        if dados.ndim != 2 or dados.shape[1] < 2:
+            return 0.0, 0.0
+
+        angulos = dados[:, 0]
+        distancias = dados[:, 1]
+        mask_frontal = (
+            np.isfinite(angulos)
+            & np.isfinite(distancias)
+            & (np.abs(angulos) <= self.angulo_frontal_rad)
+            & (distancias > 0.02)
+            & (distancias < self.raio_influencia_laser_m)
+        )
+        if not np.any(mask_frontal):
+            return 0.0, 0.0
+
+        d_frontal_min = float(np.min(distancias[mask_frontal]))
+        peso = (
+            self.raio_influencia_laser_m - d_frontal_min
+        ) / self.raio_influencia_laser_m
+        magnitude = self.ganho_simetria * peso
+
+        theta = float(pose[2])
+        # Vetor unitario a direita do chassi no referencial mundial
+        u_direita_x = math.sin(theta)
+        u_direita_y = -math.cos(theta)
+
+        return magnitude * u_direita_x, magnitude * u_direita_y
+
+    def processar_obstaculos_dinamicos(
+        self,
+        laser: np.ndarray,
+        pose: tuple[float, float, float],
+        planejador: PlanejadorGlobal,
+    ) -> None:
+        """Detecta obstaculos no espaco livre estatico com persistencia e expiracao."""
+        self._passo_atual += 1
+
+        celulas_vistas: set[Cell] = set()
+        if laser is not None and len(laser) > 0:
+            dados = np.asarray(laser, dtype=float)
+            if dados.ndim == 2 and dados.shape[1] >= 2:
+                angulos = dados[:, 0]
+                distancias = dados[:, 1]
+                mask = (
+                    np.isfinite(angulos)
+                    & np.isfinite(distancias)
+                    & (distancias > self.raio_robo_m)
+                    & (distancias <= self.alcance_dinamico_m)
+                )
+                ang_validos = angulos[mask]
+                dist_validas = distancias[mask]
+
+                xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
+                for ang, dist in zip(ang_validos, dist_validas):
+                    xw = xr + dist * math.cos(theta + ang)
+                    yw = yr + dist * math.sin(theta + ang)
+                    celula = planejador.mundo_para_celula((xw, yw))
+                    if celula is None:
+                        continue
+                    if planejador.ocupacao_estatica[celula]:
+                        continue
+                    if celula == planejador.start or celula == planejador.goal:
+                        continue
+                    celulas_vistas.add(celula)
+
+        novas_bloqueadas: list[Cell] = []
+        for celula in celulas_vistas:
+            self._contagens_persistencia[celula] = (
+                self._contagens_persistencia.get(celula, 0) + 1
+            )
+            self._ultimo_passo_visto[celula] = self._passo_atual
+            if (
+                self._contagens_persistencia[celula] >= self.passos_persistencia
+                and celula not in self._celulas_bloqueadas
+            ):
+                novas_bloqueadas.append(celula)
+                self._celulas_bloqueadas.add(celula)
+
+        if novas_bloqueadas:
+            planejador.marcar_bloqueio(novas_bloqueadas, True)
+
+        novas_desbloqueadas: list[Cell] = []
+        for celula in list(self._celulas_bloqueadas):
+            ultimo_passo = self._ultimo_passo_visto.get(celula, 0)
+            if self._passo_atual - ultimo_passo > self.passos_expiracao:
+                novas_desbloqueadas.append(celula)
+                self._celulas_bloqueadas.remove(celula)
+                self._contagens_persistencia.pop(celula, None)
+                self._ultimo_passo_visto.pop(celula, None)
+
+        if novas_desbloqueadas:
+            planejador.marcar_bloqueio(novas_desbloqueadas, False)
+
+        for celula in list(self._contagens_persistencia.keys()):
+            if celula not in self._celulas_bloqueadas:
+                if self._passo_atual - self._ultimo_passo_visto.get(celula, 0) > 2:
+                    self._contagens_persistencia.pop(celula, None)
+                    self._ultimo_passo_visto.pop(celula, None)
+
+    def monitorar_estagnacao(
+        self, pose: tuple[float, float, float], distancia_ao_goal: float
+    ) -> bool:
+        """Detecta travamento sem confundir curva lenta e conduz recuperacao."""
+        if self._estado_recuperacao == self.ESTADO_RECUO:
+            self._passos_em_recuperacao += 1
+            if self._passos_em_recuperacao >= self.passos_recuo:
+                self._estado_recuperacao = self.ESTADO_GIRO
+                self._passos_em_recuperacao = 0
+            return True
+
+        if self._estado_recuperacao == self.ESTADO_GIRO:
+            self._passos_em_recuperacao += 1
+            if self._passos_em_recuperacao >= self.passos_giro:
+                self._estado_recuperacao = self.ESTADO_NORMAL
+                self._passos_em_recuperacao = 0
+                self._historico_poses.clear()
+                return False
+            return True
+
+        xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
+        self._historico_poses.append((self._passo_atual, xr, yr, theta))
+        if len(self._historico_poses) > self.janela_estagnacao_passos:
+            self._historico_poses.pop(0)
+
+        if len(self._historico_poses) == self.janela_estagnacao_passos:
+            _, x_antigo, y_antigo, theta_antigo = self._historico_poses[0]
+            deslocamento = math.hypot(xr - x_antigo, yr - y_antigo)
+            diff_ang = abs(
+                (theta - theta_antigo + math.pi) % (2.0 * math.pi) - math.pi
+            )
+
+            if (
+                deslocamento < self.limiar_deslocamento_estagnacao_m
+                and diff_ang < self.limiar_angulo_estagnacao_rad
+                and distancia_ao_goal > self.tolerancia_goal_m
+            ):
+                self._estado_recuperacao = self.ESTADO_RECUO
+                self._passos_em_recuperacao = 0
+                self._historico_poses.clear()
+                return True
+
+        return False
+
+    def calcular_vetor_desejado(
+        self,
+        pose: tuple[float, float, float],
+        caminho: list[WorldPoint],
+        laser: np.ndarray,
+        goal: WorldPoint,
+    ) -> tuple[float, float] | None:
+        """Combina lookahead, repulsao e quebra de simetria em vetor (vx, vy)."""
+        xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
+        dist_goal = math.hypot(goal[0] - xr, goal[1] - yr)
+
+        em_recuperacao = self.monitorar_estagnacao(pose, dist_goal)
+        if em_recuperacao:
+            d_c = self.distancia_controle_m
+            if self._estado_recuperacao == self.ESTADO_RECUO:
+                v_rec = -0.20
+                w_rec = -0.30
+                vx = math.cos(theta) * v_rec - d_c * math.sin(theta) * w_rec
+                vy = math.sin(theta) * v_rec + d_c * math.cos(theta) * w_rec
+                return vx, vy
+            elif self._estado_recuperacao == self.ESTADO_GIRO:
+                v_giro = 0.0
+                w_giro = -1.0
+                vx = -d_c * math.sin(theta) * w_giro
+                vy = d_c * math.cos(theta) * w_giro
+                return vx, vy
+
+        wp = self.selecionar_lookahead(pose, caminho)
+        if wp is None:
+            if not caminho and dist_goal > self.tolerancia_goal_m:
+                self._estado_recuperacao = self.ESTADO_RECUO
+                self._passos_em_recuperacao = 0
+                d_c = self.distancia_controle_m
+                v_rec = -0.20
+                w_rec = -0.30
+                vx = math.cos(theta) * v_rec - d_c * math.sin(theta) * w_rec
+                vy = math.sin(theta) * v_rec + d_c * math.cos(theta) * w_rec
+                return vx, vy
+            return None
+
+        v_att_x, v_att_y = self.calcular_atracao(pose, wp)
+        f_rep_x, f_rep_y = self.calcular_repulsao(pose, laser)
+        f_sym_x, f_sym_y = self.calcular_quebra_simetria(pose, laser)
+
+        v_tot_x = v_att_x + f_rep_x + f_sym_x
+        v_tot_y = v_att_y + f_rep_y + f_sym_y
+
+        norma = math.hypot(v_tot_x, v_tot_y)
+        if norma < 1e-9:
+            return None
+
+        v_alvo = self.velocidade_desejada_m_s
+        if laser is not None and len(laser) > 0:
+            dados = np.asarray(laser, dtype=float)
+            if dados.ndim == 2 and dados.shape[1] >= 2:
+                ang = dados[:, 0]
+                dst = dados[:, 1]
+                mask_f = (
+                    np.abs(ang) <= self.angulo_frontal_rad
+                ) & (dst > 0.02) & np.isfinite(dst)
+                if np.any(mask_f):
+                    d_min_f = float(np.min(dst[mask_f]))
+                    if d_min_f < 0.50:
+                        v_alvo = max(
+                            0.18, self.velocidade_desejada_m_s * (d_min_f / 0.50)
+                        )
+
+        escala = v_alvo / norma
+        return v_tot_x * escala, v_tot_y * escala
+
+
 __all__ = [
     "Agent",
+    "CamadaReativa",
     "Cell",
     "Controlador",
     "DetectorDeChegada",
@@ -853,11 +1259,12 @@ __all__ = [
 
 
 class Agent:
-    """Executa a navegacao deliberativa de um PioneerP3DX.
+    """Executa a navegacao deliberativa e reativa de um PioneerP3DX.
 
-    A classe mantem estado entre ciclos para planejar a rota ate o goal
-    corrente, converter o vetor de velocidade em comandos de roda e avancar
-    para o proximo destino confirmado.
+    A classe mantem estado entre ciclos para planejar a rota D* Lite,
+    desviar reativamente de obstaculos com base no sensor laser Hokuyo,
+    detectar e contornar obstaculos dinamicos, converter o vetor de
+    velocidade em comandos de roda e avancar para os proximos destinos.
     """
 
     MAPA_LARGURA_M = 30.0
@@ -868,6 +1275,7 @@ class Agent:
     MARGEM_SEGURANCA_M = 0.15
     TOLERANCIA_GOAL_M = 0.10
     VELOCIDADE_DESEJADA_M_S = 0.50
+    LOOKAHEAD_M = 0.60
 
     def __init__(self, id_robo):
         """Inicializa o agente sem alterar a assinatura exigida pelo TP2.
@@ -885,6 +1293,13 @@ class Agent:
         self._sensoriamento = Sensoriamento()
         self._controlador = Controlador()
         self._detector_chegada = DetectorDeChegada()
+        self._camada_reativa = CamadaReativa(
+            distancia_lookahead_m=self.LOOKAHEAD_M,
+            velocidade_desejada_m_s=self.VELOCIDADE_DESEJADA_M_S,
+            distancia_controle_m=self._controlador.distancia_controle_m,
+            tolerancia_goal_m=self.TOLERANCIA_GOAL_M,
+            raio_robo_m=self.RAIO_ROBO_M,
+        )
         self._assinatura_goals: tuple[tuple[float, float], ...] | None = None
         self._indice_goal = 0
         self._goal_planejado: tuple[float, float] | None = None
@@ -915,23 +1330,28 @@ class Agent:
             self._parar_rodas(sim)
             self._indice_goal += 1
             self._goal_planejado = None
+            self._camada_reativa.resetar_recuperacao()
             if self._indice_goal < len(goals):
                 proximo_goal = goals[self._indice_goal]
                 self._planejador.definir_goal(proximo_goal)
                 self._goal_planejado = proximo_goal
             return True
 
+        laser = self._sensoriamento.obter_laser(sim, self.robotname)
+        self._camada_reativa.processar_obstaculos_dinamicos(
+            laser, pose, self._planejador
+        )
+
         self._planejador.atualizar(pose)
         caminho = self._planejador.caminho_completo(pose)
-        waypoint = self._primeiro_waypoint_a_frente(caminho)
-        if waypoint is None:
-            self._parar_rodas(sim)
-            return False
 
-        vetor = self._vetor_para_waypoint(pose, waypoint)
+        vetor = self._camada_reativa.calcular_vetor_desejado(
+            pose, caminho, laser, goal_atual
+        )
         if vetor is None:
             self._parar_rodas(sim)
             return False
+
         v, w = self._controlador.controlar(pose, vetor)
         wl, wr = self._controlador.para_velocidades_roda(v, w, self.L, self.r)
         self._enviar_velocidades_roda(sim, wl, wr)
@@ -966,6 +1386,7 @@ class Agent:
             self._assinatura_goals = goals
             self._indice_goal = 0
             self._goal_planejado = None
+            self._camada_reativa.resetar_recuperacao()
 
     @staticmethod
     def _normalizar_goals(
