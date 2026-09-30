@@ -1,166 +1,1022 @@
+from __future__ import annotations
+
 import math
+import heapq
+from numbers import Real
+from typing import Iterable, TypeAlias
+
 import numpy as np
 
-class HokuyoSensorSim(object):
-    """
-    Simulates a Hokuyo laser sensor in CoppeliaSim using vision sensors.
 
-    This class provides an interface to interact with a simulated Hokuyo sensor,
-    typically attached to a robot in CoppeliaSim. It manages the underlying vision
-    sensors and provides methods to retrieve sensor data in either range or point format.
+Cell: TypeAlias = tuple[int, int]
+WorldPoint: TypeAlias = tuple[float, float]
 
-    Attributes:
-        _sim: The simulation API object used to interact with CoppeliaSim.
-        _base_name (str): The name of the base object to which the Hokuyo sensor is attached.
-        _is_range_data (bool): Determines if sensor data is returned as range values (True) or 3D points (False).
-        _base_obj: The handle of the base object in the simulation.
-        _vision_sensors_obj (list): Handles of the vision sensors used to simulate the Hokuyo sensor.
+
+class PlanejadorGlobal:
+    """Constroi e mantem o grid de ocupacao estatico do ambiente.
 
     Args:
-        sim: The simulation API object.
-        base_name (str): The name of the base object (must contain 'fastHokuyo').
-        is_range_data (bool, optional): If True, sensor data is returned as range values. Defaults to False.
+        img: Imagem ``H x W`` monocromatica ou ``H x W x 3/4`` RGB/RGBA. Valores
+            escuros representam obstaculos; a entrada pode estar em ``[0, 1]``
+            ou ``[0, 255]``.
+        escala: Metros por pixel, como escalar ou tupla ``(sx, sy)``.
+        origem: Coordenada mundial ``(x, y)`` do canto inferior esquerdo da
+            imagem. A linha zero da imagem permanece no topo, como na Aula 13.
+        tamanho_celula_m: Lado, em metros, de cada celula do grid.
+        raio_robo_m: Raio de colisao usado na inflacao das paredes.
+        margem_seguranca_m: Margem adicional de seguranca usada na inflacao.
 
-    Raises:
-        ValueError: If 'fastHokuyo' is not in the base_name, or if the base object or vision sensors are not found.
-
-    Methods:
-        get_is_range_data() -> bool:
-            Returns whether sensor data is returned as range values.
-
-        set_is_range_data(is_range_data: bool) -> None:
-            Sets whether sensor data should be returned as range values.
-
-        getSensorData():
-            Retrieves sensor data from the vision sensors.
-            Returns either a list of range values or a list of 3D points, depending on _is_range_data.
+    Attributes:
+        ocupacao_estatica: Matriz booleana ``(linha, coluna)`` com paredes ja
+            infladas. ``True`` significa que a celula nao pode ser percorrida.
+        ocupacao: Copia que sera atualizada pelos bloqueios dinamicos. Nesta
+            etapa ela ainda e identica a ``ocupacao_estatica``.
     """
 
-    _sim = None
+    def __init__(
+        self,
+        img: np.ndarray,
+        escala: float | tuple[float, float],
+        origem: tuple[float, float],
+        *,
+        tamanho_celula_m: float = 0.10,
+        raio_robo_m: float = 0.26,
+        margem_seguranca_m: float = 0.15,
+    ) -> None:
+        self.escala_x_m_por_pixel, self.escala_y_m_por_pixel = (
+            self._normalizar_escala(escala)
+        )
+        self.origem = self._normalizar_origem(origem)
+        self.tamanho_celula_m = self._validar_positivo(
+            tamanho_celula_m, "tamanho_celula_m"
+        )
+        self.raio_robo_m = self._validar_nao_negativo(raio_robo_m, "raio_robo_m")
+        self.margem_seguranca_m = self._validar_nao_negativo(
+            margem_seguranca_m, "margem_seguranca_m"
+        )
 
-    _base_name = ""
+        pixels_ocupados = self._binarizar_imagem(img)
+        self.altura_pixels, self.largura_pixels = pixels_ocupados.shape
+        self.altura_m = self.altura_pixels * self.escala_y_m_por_pixel
+        self.largura_m = self.largura_pixels * self.escala_x_m_por_pixel
+        self.rows = math.ceil(self.altura_m / self.tamanho_celula_m)
+        self.cols = math.ceil(self.largura_m / self.tamanho_celula_m)
+
+        ocupacao_base = self._agrupar_pixels_em_grid(pixels_ocupados)
+        raio_inflacao = self.raio_robo_m + self.margem_seguranca_m
+        self.ocupacao_estatica = self._inflar_obstaculos(
+            ocupacao_base, raio_inflacao
+        )
+        self.ocupacao_dinamica = np.zeros_like(self.ocupacao_estatica, dtype=bool)
+        self.ocupacao = self.ocupacao_estatica.copy()
+
+        # Estado D* Lite. Os dicionarios sao esparsos: ausencia equivale a inf.
+        self.g: dict[Cell, float] = {}
+        self.rhs: dict[Cell, float] = {}
+        self.U: list[tuple[float, float, int, Cell]] = []
+        self.km = 0.0
+        self.goal: Cell | None = None
+        self.goal_xy: WorldPoint | None = None
+        self.start: Cell | None = None
+        self.last_start: Cell | None = None
+        self._chaves_atuais: dict[Cell, tuple[float, float]] = {}
+        self._contador_fila = 0
+        self._celulas_dinamicas_pendentes: set[Cell] = set()
+        self._replanejamento_pendente = False
+
+    @staticmethod
+    def _validar_positivo(valor: float, nome: str) -> float:
+        """Valida e normaliza uma distancia estritamente positiva em metros."""
+        if not isinstance(valor, Real) or not math.isfinite(float(valor)) or valor <= 0:
+            raise ValueError(f"{nome} deve ser um numero finito maior que zero")
+        return float(valor)
+
+    @staticmethod
+    def _validar_nao_negativo(valor: float, nome: str) -> float:
+        """Valida e normaliza uma distancia nao negativa em metros."""
+        if not isinstance(valor, Real) or not math.isfinite(float(valor)) or valor < 0:
+            raise ValueError(f"{nome} deve ser um numero finito maior ou igual a zero")
+        return float(valor)
+
+    @classmethod
+    def _normalizar_escala(
+        cls, escala: float | tuple[float, float]
+    ) -> tuple[float, float]:
+        """Converte escala escalar ou ``(sx, sy)`` para metros por pixel."""
+        if isinstance(escala, Real):
+            valor = cls._validar_positivo(float(escala), "escala")
+            return valor, valor
+
+        if len(escala) != 2:
+            raise ValueError("escala deve ser um numero ou uma tupla (sx, sy)")
+        return (
+            cls._validar_positivo(escala[0], "escala[0]"),
+            cls._validar_positivo(escala[1], "escala[1]"),
+        )
+
+    @staticmethod
+    def _normalizar_origem(origem: tuple[float, float]) -> WorldPoint:
+        """Valida a coordenada mundial do canto inferior esquerdo do mapa."""
+        if len(origem) != 2 or not all(
+            isinstance(valor, Real) and math.isfinite(float(valor)) for valor in origem
+        ):
+            raise ValueError("origem deve ser uma tupla finita (x, y)")
+        return float(origem[0]), float(origem[1])
+
+    @staticmethod
+    def _binarizar_imagem(img: np.ndarray) -> np.ndarray:
+        """Retorna matriz booleana na qual ``True`` significa pixel ocupado.
+
+        O limiar de luminosidade e ``0,5`` apos normalizacao, equivalente a
+        inverter preto/branco e binarizar no notebook da Aula 13.
+        """
+        imagem = np.asarray(img)
+        if imagem.ndim == 2:
+            luminancia = imagem.astype(float)
+        elif imagem.ndim == 3 and imagem.shape[2] in (3, 4):
+            rgb = imagem[..., :3].astype(float)
+            luminancia = (
+                0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+            )
+        else:
+            raise ValueError("img deve ter formato HxW, HxWx3 ou HxWx4")
+
+        if luminancia.size == 0 or not np.all(np.isfinite(luminancia)):
+            raise ValueError("img deve conter ao menos um pixel finito")
+
+        if float(np.max(luminancia)) > 1.0:
+            luminancia = luminancia / 255.0
+        luminancia = np.clip(luminancia, 0.0, 1.0)
+        return luminancia < 0.5
+
+    def _agrupar_pixels_em_grid(self, pixels_ocupados: np.ndarray) -> np.ndarray:
+        """Agrupa pixels por celula; qualquer pixel ocupado bloqueia o bloco.
+
+        Esta e a mesma decisao de ocupacao usada no notebook de Aula 13, onde
+        o somatorio do bloco e binarizado acima de zero.
+        """
+        grade = np.zeros((self.rows, self.cols), dtype=bool)
+        for linha in range(self.rows):
+            y_inicio = int(
+                math.floor(
+                    linha * self.tamanho_celula_m / self.escala_y_m_por_pixel
+                )
+            )
+            y_fim = min(
+                self.altura_pixels,
+                int(
+                    math.ceil(
+                        (linha + 1)
+                        * self.tamanho_celula_m
+                        / self.escala_y_m_por_pixel
+                    )
+                ),
+            )
+            for coluna in range(self.cols):
+                x_inicio = int(
+                    math.floor(
+                        coluna * self.tamanho_celula_m / self.escala_x_m_por_pixel
+                    )
+                )
+                x_fim = min(
+                    self.largura_pixels,
+                    int(
+                        math.ceil(
+                            (coluna + 1)
+                            * self.tamanho_celula_m
+                            / self.escala_x_m_por_pixel
+                        )
+                    ),
+                )
+                if y_inicio < y_fim and x_inicio < x_fim:
+                    grade[linha, coluna] = bool(
+                        np.any(pixels_ocupados[y_inicio:y_fim, x_inicio:x_fim])
+                    )
+        return grade
+
+    def _inflar_obstaculos(
+        self, ocupacao_base: np.ndarray, raio_m: float
+    ) -> np.ndarray:
+        """Dilata paredes com um disco de raio ``raio_m`` sem SciPy."""
+        if raio_m == 0:
+            return ocupacao_base.copy()
+
+        alcance = math.ceil(raio_m / self.tamanho_celula_m)
+        inflada = ocupacao_base.copy()
+        for delta_linha in range(-alcance, alcance + 1):
+            for delta_coluna in range(-alcance, alcance + 1):
+                distancia = math.hypot(delta_linha, delta_coluna) * self.tamanho_celula_m
+                if distancia > raio_m + 1e-12:
+                    continue
+
+                destino_linha_inicio = max(0, delta_linha)
+                destino_linha_fim = min(self.rows, self.rows + delta_linha)
+                destino_coluna_inicio = max(0, delta_coluna)
+                destino_coluna_fim = min(self.cols, self.cols + delta_coluna)
+                origem_linha_inicio = max(0, -delta_linha)
+                origem_linha_fim = self.rows - max(0, delta_linha)
+                origem_coluna_inicio = max(0, -delta_coluna)
+                origem_coluna_fim = self.cols - max(0, delta_coluna)
+
+                inflada[
+                    destino_linha_inicio:destino_linha_fim,
+                    destino_coluna_inicio:destino_coluna_fim,
+                ] |= ocupacao_base[
+                    origem_linha_inicio:origem_linha_fim,
+                    origem_coluna_inicio:origem_coluna_fim,
+                ]
+        return inflada
+
+    def mundo_para_celula(self, ponto_xy: WorldPoint) -> Cell | None:
+        """Converte ``(x, y)`` mundial para ``(linha, coluna)`` ou ``None``.
+
+        A linha e invertida porque a imagem possui origem no canto superior,
+        enquanto o eixo ``y`` do CoppeliaSim cresce para cima.
+        """
+        x, y = float(ponto_xy[0]), float(ponto_xy[1])
+        if not math.isfinite(x) or not math.isfinite(y):
+            return None
+        coluna = math.floor((x - self.origem[0]) / self.tamanho_celula_m)
+        linha_mundo = math.floor((y - self.origem[1]) / self.tamanho_celula_m)
+        if not (0 <= coluna < self.cols and 0 <= linha_mundo < self.rows):
+            return None
+        return self.rows - 1 - linha_mundo, coluna
+
+    def celula_para_mundo(self, celula: Cell) -> WorldPoint:
+        """Retorna o centro mundial da celula ``(linha, coluna)`` informada."""
+        linha, coluna = celula
+        if not (0 <= linha < self.rows and 0 <= coluna < self.cols):
+            raise ValueError("celula fora dos limites do grid")
+        return (
+            self.origem[0] + (coluna + 0.5) * self.tamanho_celula_m,
+            self.origem[1] + (self.rows - linha - 0.5) * self.tamanho_celula_m,
+        )
+
+    def definir_goal(self, goal_xy: WorldPoint) -> None:
+        """Reinicializa D* Lite para o novo goal mundial ``(x, y)``.
+
+        O goal precisa estar dentro de uma celula livre do mapa estatico. A
+        Bloqueios dinamicos posteriores podem torna-lo indisponivel; nesse
+        caso, ``caminho_completo`` retorna uma lista vazia ate o desbloqueio.
+        """
+        goal = self.mundo_para_celula(goal_xy)
+        if goal is None:
+            raise ValueError("goal esta fora dos limites do mapa")
+        if self.ocupacao_estatica[goal]:
+            raise ValueError("goal pertence a uma celula ocupada no mapa estatico")
+
+        self.g.clear()
+        self.rhs.clear()
+        self.U.clear()
+        self._chaves_atuais.clear()
+        self.km = 0.0
+        self.goal = goal
+        self.goal_xy = (float(goal_xy[0]), float(goal_xy[1]))
+        self.start = None
+        self.last_start = None
+        self.rhs[goal] = 0.0
+        self._inserir_fila(goal)
+        self._replanejamento_pendente = True
+
+    def marcar_bloqueio(self, celulas: list[Cell], bloqueado: bool) -> None:
+        """Marca ou libera celulas dinamicas no grid.
+
+        Args:
+            celulas: Lista de indices ``(linha, coluna)`` do grid. Celulas fora
+                do mapa sao ignoradas para tornar a fronteira com sensores
+                segura.
+            bloqueado: ``True`` adiciona um obstaculo dinamico; ``False`` o
+                remove. Paredes estaticas infladas nunca sao removidas.
+
+        A propagacao D* Lite ocorre em ``atualizar``. Assim, varias mudancas no
+        mesmo ciclo produzem uma unica busca incremental.
+        """
+        if not isinstance(bloqueado, (bool, np.bool_)):
+            raise ValueError("bloqueado deve ser booleano")
+
+        for celula in celulas:
+            if not self._celula_valida(celula):
+                continue
+            linha, coluna = celula
+            # Uma parede estatica ja esta ocupada, portanto marca dinamica nao
+            # acrescenta informacao e uma liberacao jamais a afeta.
+            if self.ocupacao_estatica[linha, coluna]:
+                continue
+            novo_valor = bool(bloqueado)
+            if self.ocupacao_dinamica[linha, coluna] == novo_valor:
+                continue
+            self.ocupacao_dinamica[linha, coluna] = novo_valor
+            self.ocupacao[linha, coluna] = novo_valor
+            self._celulas_dinamicas_pendentes.add(celula)
+            self._replanejamento_pendente = True
+
+    def atualizar(self, pose_atual: tuple[float, float, float]) -> None:
+        """Propaga apenas alteracoes de start ou de custo desde o ultimo ciclo.
+
+        Args:
+            pose_atual: Pose mundial ``(x, y, theta)``. Somente ``x`` e ``y``
+                determinam a celula de inicio do D* Lite.
+        """
+        if self.goal is None:
+            return
+        if len(pose_atual) < 2:
+            raise ValueError("pose_atual deve conter ao menos x e y")
+
+        start = self.mundo_para_celula((pose_atual[0], pose_atual[1]))
+        if start is None:
+            self.start = None
+            return
+
+        start_mudou = start != self.last_start
+        if self.last_start is not None and start_mudou:
+            self.km += self._heuristica(self.last_start, start)
+        self.start = start
+        self.last_start = start
+
+        if not (start_mudou or self._replanejamento_pendente):
+            return
+
+        for celula in self._celulas_dinamicas_pendentes:
+            self._atualizar_vertice(celula)
+            for predecessor in self._vizinhos(celula):
+                self._atualizar_vertice(predecessor)
+        self._celulas_dinamicas_pendentes.clear()
+        self._compute_shortest_path()
+        self._replanejamento_pendente = False
+
+    def caminho_completo(
+        self, pose_atual: tuple[float, float, float]
+    ) -> list[WorldPoint]:
+        """Retorna caminho mundial suavizado entre pose e goal, ou ``[]``.
+
+        A lista inclui o centro da celula inicial e termina na coordenada exata
+        passada a ``definir_goal``. A estrategia de navegacao pode escolher
+        qualquer waypoint da lista para compor seu vetor de velocidade.
+        """
+        if self.goal is None or self.goal_xy is None:
+            return []
+        self.atualizar(pose_atual)
+        if (
+            self.start is None
+            or self.ocupacao[self.start]
+            or self.ocupacao[self.goal]
+            or math.isinf(self._g(self.start))
+        ):
+            return []
+
+        caminho_celulas = self._extrair_caminho_celulas()
+        if not caminho_celulas:
+            return []
+        caminho_suavizado = self._suavizar_caminho(caminho_celulas)
+        caminho = [self.celula_para_mundo(celula) for celula in caminho_suavizado]
+        caminho[-1] = self.goal_xy
+        return caminho
+
+    def _celula_valida(self, celula: object) -> bool:
+        """Indica se o objeto representa indice de celula dentro da grade."""
+        if not isinstance(celula, tuple) or len(celula) != 2:
+            return False
+        linha, coluna = celula
+        return (
+            isinstance(linha, (int, np.integer))
+            and isinstance(coluna, (int, np.integer))
+            and 0 <= int(linha) < self.rows
+            and 0 <= int(coluna) < self.cols
+        )
+
+    def _g(self, celula: Cell) -> float:
+        """Retorna ``g(celula)``; valores nao visitados representam infinito."""
+        return self.g.get(celula, math.inf)
+
+    def _rhs(self, celula: Cell) -> float:
+        """Retorna ``rhs(celula)``; valores nao visitados representam infinito."""
+        return self.rhs.get(celula, math.inf)
+
+    @staticmethod
+    def _quase_igual(primeiro: float, segundo: float) -> bool:
+        """Compara custos finitos e infinitos sem ruido de ponto flutuante."""
+        return math.isclose(primeiro, segundo, rel_tol=1e-12, abs_tol=1e-12)
+
+    def _heuristica(self, origem: Cell, destino: Cell) -> float:
+        """Distancia octil admissivel para a vizinhanca 8-conexa."""
+        delta_linha = abs(origem[0] - destino[0])
+        delta_coluna = abs(origem[1] - destino[1])
+        menor = min(delta_linha, delta_coluna)
+        return max(delta_linha, delta_coluna) + (math.sqrt(2.0) - 1.0) * menor
+
+    def _calcular_chave(self, celula: Cell) -> tuple[float, float]:
+        """Calcula a chave lexicografica D* Lite da celula fornecida."""
+        if self.start is None:
+            raise RuntimeError("start deve existir antes de calcular chave D* Lite")
+        menor = min(self._g(celula), self._rhs(celula))
+        return menor + self._heuristica(self.start, celula) + self.km, menor
+
+    def _inserir_fila(self, celula: Cell) -> None:
+        """Insere ou atualiza uma chave usando invalidacao preguiçosa no heap."""
+        # Antes da primeira pose, o goal ainda deve ser enfileirado. A chave
+        # usa o proprio goal como referencia temporaria; ela e corrigida quando
+        # ``atualizar`` recebe o primeiro start.
+        if self.start is None:
+            menor = min(self._g(celula), self._rhs(celula))
+            chave = menor, menor
+        else:
+            chave = self._calcular_chave(celula)
+        self._chaves_atuais[celula] = chave
+        self._contador_fila += 1
+        heapq.heappush(self.U, (*chave, self._contador_fila, celula))
+
+    def _topo_valido(self) -> tuple[tuple[float, float], Cell] | None:
+        """Descarta entradas antigas e le a menor chave ainda valida."""
+        while self.U:
+            primeira, segunda, _, celula = self.U[0]
+            chave = (primeira, segunda)
+            if self._chaves_atuais.get(celula) == chave:
+                return chave, celula
+            heapq.heappop(self.U)
+        return None
+
+    def _remover_topo_valido(self) -> tuple[tuple[float, float], Cell] | None:
+        """Extrai a menor entrada atual do heap, ignorando entradas obsoletas."""
+        topo = self._topo_valido()
+        if topo is None:
+            return None
+        _, celula = topo
+        primeira, segunda, _, celula_extraida = heapq.heappop(self.U)
+        assert celula_extraida == celula
+        self._chaves_atuais.pop(celula, None)
+        return (primeira, segunda), celula
+
+    def _vizinhos(self, celula: Cell) -> list[Cell]:
+        """Lista todos os vizinhos 8-conexos internos, inclusive ocupados."""
+        linha, coluna = celula
+        vizinhos: list[Cell] = []
+        for delta_linha in (-1, 0, 1):
+            for delta_coluna in (-1, 0, 1):
+                if delta_linha == 0 and delta_coluna == 0:
+                    continue
+                candidato = linha + delta_linha, coluna + delta_coluna
+                if self._celula_valida(candidato):
+                    vizinhos.append(candidato)
+        return vizinhos
+
+    def _custo(self, origem: Cell, destino: Cell) -> float:
+        """Retorna custo de aresta ou infinito se o movimento for inviavel."""
+        if self.ocupacao[origem] or self.ocupacao[destino]:
+            return math.inf
+        delta_linha = destino[0] - origem[0]
+        delta_coluna = destino[1] - origem[1]
+        if abs(delta_linha) > 1 or abs(delta_coluna) > 1 or (
+            delta_linha == 0 and delta_coluna == 0
+        ):
+            return math.inf
+        if delta_linha != 0 and delta_coluna != 0:
+            # Impede cortar o canto entre duas paredes ortogonais.
+            if self.ocupacao[origem[0], destino[1]] or self.ocupacao[destino[0], origem[1]]:
+                return math.inf
+            return math.sqrt(2.0)
+        return 1.0
+
+    def _atualizar_vertice(self, celula: Cell) -> None:
+        """Aplica ``updateVertex`` do D* Lite a uma celula."""
+        if self.goal is None:
+            return
+        if celula != self.goal:
+            melhor = min(
+                (self._custo(celula, vizinho) + self._g(vizinho))
+                for vizinho in self._vizinhos(celula)
+            )
+            self.rhs[celula] = melhor
+
+        self._chaves_atuais.pop(celula, None)
+        if not self._quase_igual(self._g(celula), self._rhs(celula)):
+            self._inserir_fila(celula)
+
+    def _compute_shortest_path(self) -> None:
+        """Executa ``computeShortestPath`` ate consistencia do start atual."""
+        if self.start is None or self.goal is None:
+            return
+
+        while True:
+            topo = self._topo_valido()
+            precisa_processar = (
+                topo is not None and topo[0] < self._calcular_chave(self.start)
+            ) or not self._quase_igual(self._rhs(self.start), self._g(self.start))
+            if not precisa_processar:
+                break
+            if topo is None:
+                break
+
+            chave_antiga, vertice = self._remover_topo_valido()  # type: ignore[misc]
+            chave_nova = self._calcular_chave(vertice)
+            if chave_antiga < chave_nova:
+                self._inserir_fila(vertice)
+            elif self._g(vertice) > self._rhs(vertice):
+                self.g[vertice] = self._rhs(vertice)
+                for predecessor in self._vizinhos(vertice):
+                    self._atualizar_vertice(predecessor)
+            else:
+                self.g[vertice] = math.inf
+                self._atualizar_vertice(vertice)
+                for predecessor in self._vizinhos(vertice):
+                    self._atualizar_vertice(predecessor)
+
+    def _extrair_caminho_celulas(self) -> list[Cell]:
+        """Segue o sucessor de menor ``custo + g`` do start ate o goal."""
+        if self.start is None or self.goal is None:
+            return []
+        atual = self.start
+        caminho = [atual]
+        visitadas = {atual}
+        while atual != self.goal:
+            opcoes = [
+                (self._custo(atual, vizinho) + self._g(vizinho), vizinho)
+                for vizinho in self._vizinhos(atual)
+            ]
+            opcoes = [opcao for opcao in opcoes if math.isfinite(opcao[0])]
+            if not opcoes:
+                return []
+            _, proximo = min(opcoes, key=lambda opcao: (opcao[0], opcao[1]))
+            if proximo in visitadas:
+                return []
+            caminho.append(proximo)
+            visitadas.add(proximo)
+            atual = proximo
+            if len(caminho) > self.rows * self.cols:
+                return []
+        return caminho
+
+    def _linha_livre(self, origem: Cell, destino: Cell) -> bool:
+        """Verifica linha de visada por todas as celulas cruzadas pelo segmento."""
+        linha, coluna = origem
+        destino_linha, destino_coluna = destino
+        if self.ocupacao[origem] or self.ocupacao[destino]:
+            return False
+
+        delta_coluna = destino_coluna - coluna
+        delta_linha = destino_linha - linha
+        passo_coluna = 0 if delta_coluna == 0 else (1 if delta_coluna > 0 else -1)
+        passo_linha = 0 if delta_linha == 0 else (1 if delta_linha > 0 else -1)
+        t_delta_coluna = math.inf if delta_coluna == 0 else 1.0 / abs(delta_coluna)
+        t_delta_linha = math.inf if delta_linha == 0 else 1.0 / abs(delta_linha)
+        t_max_coluna = math.inf if delta_coluna == 0 else 0.5 / abs(delta_coluna)
+        t_max_linha = math.inf if delta_linha == 0 else 0.5 / abs(delta_linha)
+
+        while (linha, coluna) != destino:
+            if math.isclose(t_max_coluna, t_max_linha, abs_tol=1e-12):
+                # O segmento cruza um canto: ambos os lados precisam estar livres.
+                lados = ((linha, coluna + passo_coluna), (linha + passo_linha, coluna))
+                if any(
+                    not self._celula_valida(lado) or self.ocupacao[lado]
+                    for lado in lados
+                ):
+                    return False
+                linha += passo_linha
+                coluna += passo_coluna
+                t_max_linha += t_delta_linha
+                t_max_coluna += t_delta_coluna
+            elif t_max_coluna < t_max_linha:
+                coluna += passo_coluna
+                t_max_coluna += t_delta_coluna
+            else:
+                linha += passo_linha
+                t_max_linha += t_delta_linha
+            if not self._celula_valida((linha, coluna)) or self.ocupacao[linha, coluna]:
+                return False
+        return True
+
+    def _suavizar_caminho(self, caminho: list[Cell]) -> list[Cell]:
+        """Remove zig-zags mantendo somente segmentos com linha de visada livre."""
+        if len(caminho) <= 2:
+            return caminho
+        suavizado = [caminho[0]]
+        indice_origem = 0
+        while indice_origem < len(caminho) - 1:
+            indice_destino = len(caminho) - 1
+            while indice_destino > indice_origem + 1:
+                if self._linha_livre(caminho[indice_origem], caminho[indice_destino]):
+                    break
+                indice_destino -= 1
+            suavizado.append(caminho[indice_destino])
+            indice_origem = indice_destino
+        return suavizado
+
+
+class HokuyoSensorSim:
+    """Leitor do ``fastHokuyo`` modelado pelos dois vision sensors do template.
+
+    Args:
+        sim: Objeto da API remota do CoppeliaSim.
+        base_name: Caminho absoluto do sensor, por exemplo
+            ``"/PioneerP3DX[0]/fastHokuyo"``.
+        is_range_data: Quando ``True`` (padrao), retorna ``N x 2`` com angulo
+            em radianos e distancia em metros. Quando ``False``, retorna
+            ``N x 3`` com pontos no referencial do Hokuyo.
+
+    A classe nao descarta leituras por distancia nem associa pontos a robos.
+    A interpretacao das leituras cabe a estrategia de navegacao do agente.
+    """
+
     _vision_sensor_name_template = "{}/sensor{}"
+    _angle_min = -120.0 * math.pi / 180.0
+    _angle_increment = (240.0 / 684.0) * math.pi / 180.0
 
-    # _vision_sensors_obj will be initialized in __init__
-    _base_obj = None
-    _is_range_data = False
-    
-    _angle_min=-120*math.pi/180
-    _angle_max=120*math.pi/180
-    _angle_increment=(240/684)*math.pi/180 # angle: 240 deg, pts: 684
-
-    def __init__(self, sim, base_name, is_range_data=True):
-        self._sim = sim
-        self._base_name = base_name
-        self._is_range_data = is_range_data
-
+    def __init__(self, sim, base_name: str, is_range_data: bool = True) -> None:
         if "fastHokuyo" not in base_name:
             raise ValueError(
-                f"ERR: fastHokuyo must be in the base object name. Ex: `/PioneerP3DX/fastHokuyo`"
+                "base_name deve conter 'fastHokuyo', por exemplo "
+                "'/PioneerP3DX/fastHokuyo'"
             )
-
+        self._sim = sim
+        self._base_name = base_name
+        self._is_range_data = bool(is_range_data)
         self._base_obj = sim.getObject(base_name)
         if self._base_obj == -1:
-            raise ValueError(
-                f"ERR: base_obj ({self._base_obj}) is not a valid name in the simulation"
-            )
+            raise ValueError(f"objeto Hokuyo invalido: {base_name}")
 
         self._vision_sensors_obj = [
-            sim.getObject(self._vision_sensor_name_template.format(self._base_name, 1)),
-            sim.getObject(self._vision_sensor_name_template.format(self._base_name, 2)),
+            sim.getObject(self._vision_sensor_name_template.format(base_name, indice))
+            for indice in (1, 2)
         ]
-
-        if any(obj == -1 for obj in self._vision_sensors_obj):
-            raise ValueError(
-                f"ERR: the _vision_sensors_obj names are not valid in the simulation"
-            )
+        if any(objeto == -1 for objeto in self._vision_sensors_obj):
+            raise ValueError(f"vision sensor ausente abaixo de {base_name}")
 
     def get_is_range_data(self) -> bool:
+        """Informa se ``getSensorData`` devolvera pares angulo-distancia."""
         return self._is_range_data
 
     def set_is_range_data(self, is_range_data: bool) -> None:
-        self._is_range_data = is_range_data
+        """Seleciona a saida de range ``N x 2`` ou de pontos ``N x 3``."""
+        self._is_range_data = bool(is_range_data)
 
-    def getSensorData(self):
-        
-        angle = self._angle_min
-        sensor_data = []
-        
+    def getSensorData(self) -> np.ndarray:
+        """Le dados brutos dos sensores e devolve uma matriz NumPy.
+
+        Returns:
+            ``float[N, 2]`` de ``(angulo_rad, distancia_m)`` para modo range,
+            ou ``float[N, 3]`` de pontos no referencial do laser. Ausencia de
+            leituras retorna uma matriz vazia com numero de colunas correto.
+        """
+        angulo = self._angle_min
+        dados: list[list[float]] = []
+
         for vision_sensor in self._vision_sensors_obj:
-            r, t, u = sim.readVisionSensor(vision_sensor)
-            if u:
-                sensorM = sim.getObjectMatrix(vision_sensor)
-                relRefM = sim.getObjectMatrix(self._base_obj)
-                relRefM = sim.getMatrixInverse(relRefM)
-                relRefM = sim.multiplyMatrices(relRefM, sensorM)
+            resposta = self._sim.readVisionSensor(vision_sensor)
+            # A API remota pode retornar apenas o status inteiro enquanto o
+            # vision sensor ainda nao publicou o pacote auxiliar.
+            if not isinstance(resposta, (tuple, list)) or len(resposta) < 3:
+                continue
+            _, _, pacote = resposta
+            if not pacote or len(pacote) < 2:
+                continue
+            largura, altura = int(pacote[0]), int(pacote[1])
+            if largura <= 0 or altura <= 0:
+                continue
 
-                p = [0, 0, 0]
-                p = sim.multiplyVector(sensorM, p)
-                t = [p[0], p[1], p[2], 0, 0, 0]
-                for j in range(int(u[1])):
-                    for k in range(int(u[0])):
-                        w = 2 + 4 * (j * int(u[0]) + k)
-                        v = [u[w], u[w + 1], u[w + 2], u[w + 3]]
-                        angle = angle + self._angle_increment
-                        if self._is_range_data:
-                            sensor_data.append([angle, v[3]])
-                        else:
-                            p = sim.multiplyVector(relRefM, v)
-                            sensor_data.append([p[0], p[1], p[2]])
-                            
-        return np.array(sensor_data)
-    
+            transformacao_relativa = None
+            if not self._is_range_data:
+                matriz_sensor = self._sim.getObjectMatrix(vision_sensor)
+                matriz_base_inversa = self._sim.getMatrixInverse(
+                    self._sim.getObjectMatrix(self._base_obj)
+                )
+                transformacao_relativa = self._sim.multiplyMatrices(
+                    matriz_base_inversa, matriz_sensor
+                )
+
+            pontos_sensor: list[list[float]] = []
+            for linha in range(altura):
+                for coluna in range(largura):
+                    indice = 2 + 4 * (linha * largura + coluna)
+                    if indice + 3 >= len(pacote):
+                        continue
+                    leitura = pacote[indice : indice + 4]
+                    angulo += self._angle_increment
+                    if self._is_range_data:
+                        dados.append([angulo, float(leitura[3])])
+                    else:
+                        pontos_sensor.append(
+                            [float(leitura[0]), float(leitura[1]), float(leitura[2])]
+                        )
+
+            if pontos_sensor:
+                assert transformacao_relativa is not None
+                matriz = np.asarray(transformacao_relativa, dtype=float).reshape(3, 4)
+                pontos = np.asarray(pontos_sensor, dtype=float)
+                pontos_no_laser = pontos @ matriz[:, :3].T + matriz[:, 3]
+                dados.extend(pontos_no_laser.tolist())
+
+        colunas = 2 if self._is_range_data else 3
+        return np.asarray(dados, dtype=float).reshape((-1, colunas))
+
+
+class Sensoriamento:
+    """Le pose mundial e laser cru do robo sem tomar decisoes reativas."""
+
+    def __init__(self) -> None:
+        self._hokuyos: dict[tuple[int, str], HokuyoSensorSim] = {}
+
+    @staticmethod
+    def _caminho_robo(robotname: str) -> str:
+        """Normaliza nome relativo ou absoluto para um caminho CoppeliaSim."""
+        nome = robotname.strip()
+        if not nome:
+            raise ValueError("robotname nao pode ser vazio")
+        return "/" + nome.lstrip("/")
+
+    def obter_pose(self, sim, robotname: str) -> tuple[float, float, float]:
+        """Retorna pose mundial ``(x_m, y_m, theta_rad)`` do robo solicitado."""
+        handle = sim.getObject(self._caminho_robo(robotname))
+        if handle == -1:
+            raise ValueError(f"robo nao encontrado: {robotname}")
+        posicao = sim.getObjectPosition(handle, -1)
+        orientacao = sim.getObjectOrientation(handle, -1)
+        return float(posicao[0]), float(posicao[1]), float(orientacao[2])
+
+    def obter_laser(self, sim, robotname: str) -> np.ndarray:
+        """Retorna laser cru ``N x 2`` nas colunas ``(angulo_rad, distancia_m)``."""
+        caminho = self._caminho_robo(robotname)
+        chave = (id(sim), caminho)
+        leitor = self._hokuyos.get(chave)
+        if leitor is None:
+            leitor = HokuyoSensorSim(sim, f"{caminho}/fastHokuyo", is_range_data=True)
+            self._hokuyos[chave] = leitor
+        return leitor.getSensorData()
+
+
+class Controlador:
+    """Converte vetor de velocidade no mundo em comando diferencial ``(v, w)``.
+
+    O controlador aplica a transformacao de Desai et al. (1998). Ele nao sabe
+    se o vetor recebido veio de um waypoint global, de campos potenciais ou da
+    soma de ambos, portanto pode ser reutilizado por qualquer estrategia de
+    navegacao que produza um vetor de velocidade no mundo.
+    """
+
+    def __init__(
+        self,
+        *,
+        distancia_controle_m: float = 0.20,
+        v_max_m_s: float = 0.65,
+        w_max_rad_s: float = 1.80,
+    ) -> None:
+        if distancia_controle_m <= 0:
+            raise ValueError("distancia_controle_m deve ser maior que zero")
+        if v_max_m_s <= 0 or w_max_rad_s <= 0:
+            raise ValueError("limites de velocidade devem ser maiores que zero")
+        self.distancia_controle_m = float(distancia_controle_m)
+        self.v_max_m_s = float(v_max_m_s)
+        self.w_max_rad_s = float(w_max_rad_s)
+
+    def controlar(
+        self,
+        pose_atual: tuple[float, float, float],
+        vetor_xy_desejado: tuple[float, float],
+    ) -> tuple[float, float]:
+        """Transforma vetor mundial ``(vx, vy)`` em ``(v_m_s, w_rad_s)``.
+
+        A equacao usada e ``v=cos(theta)vx+sin(theta)vy`` e
+        ``w=(-sin(theta)vx+cos(theta)vy)/d``. A saida e saturada para evitar
+        comandos irreais ao PioneerP3DX.
+        """
+        if len(pose_atual) < 3 or len(vetor_xy_desejado) != 2:
+            raise ValueError("pose requer (x, y, theta) e vetor requer (vx, vy)")
+        theta = float(pose_atual[2])
+        vx, vy = float(vetor_xy_desejado[0]), float(vetor_xy_desejado[1])
+        if not all(math.isfinite(valor) for valor in (theta, vx, vy)):
+            raise ValueError("pose e vetor devem conter valores finitos")
+        if math.hypot(vx, vy) < 1e-12:
+            return 0.0, 0.0
+
+        cosseno = math.cos(theta)
+        seno = math.sin(theta)
+        v = cosseno * vx + seno * vy
+        w = (-seno * vx + cosseno * vy) / self.distancia_controle_m
+        return (
+            float(np.clip(v, -self.v_max_m_s, self.v_max_m_s)),
+            float(np.clip(w, -self.w_max_rad_s, self.w_max_rad_s)),
+        )
+
+    @staticmethod
+    def para_velocidades_roda(v: float, w: float, L: float, r: float) -> tuple[float, float]:
+        """Converte ``(v_m_s, w_rad_s)`` em ``(wl_rad_s, wr_rad_s)``.
+
+        Args:
+            v: Velocidade linear do centro do eixo.
+            w: Velocidade angular do chassi.
+            L: Distancia entre rodas, em metros.
+            r: Raio de cada roda, em metros e estritamente positivo.
+        """
+        if not math.isfinite(float(v)) or not math.isfinite(float(w)):
+            raise ValueError("v e w devem ser finitos")
+        if not math.isfinite(float(L)) or L < 0:
+            raise ValueError("L deve ser finito e nao negativo")
+        if not math.isfinite(float(r)) or r <= 0:
+            raise ValueError("r deve ser finito e maior que zero")
+        wl = v / r - (w * L) / (2.0 * r)
+        wr = v / r + (w * L) / (2.0 * r)
+        return float(wl), float(wr)
+
+
+class DetectorDeChegada:
+    """Verifica chegada apenas pela distancia euclidiana no plano mundial."""
+
+    def chegou(
+        self,
+        pose_atual: tuple[float, float, float],
+        goal: WorldPoint,
+        tol: float,
+    ) -> bool:
+        """Retorna ``True`` quando ``||(x, y) - goal|| <= tol``."""
+        if len(pose_atual) < 2 or len(goal) != 2:
+            raise ValueError("pose e goal devem conter coordenadas x e y")
+        if not math.isfinite(float(tol)) or tol < 0:
+            raise ValueError("tol deve ser finita e nao negativa")
+        distancia = math.hypot(
+            float(pose_atual[0]) - float(goal[0]),
+            float(pose_atual[1]) - float(goal[1]),
+        )
+        tolerancia = float(tol)
+        return distancia < tolerancia or math.isclose(
+            distancia, tolerancia, rel_tol=0.0, abs_tol=1e-12
+        )
+
+
+__all__ = [
+    "Agent",
+    "Cell",
+    "Controlador",
+    "DetectorDeChegada",
+    "HokuyoSensorSim",
+    "PlanejadorGlobal",
+    "Sensoriamento",
+    "WorldPoint",
+]
+
+
 class Agent:
+    """Executa a navegacao deliberativa de um PioneerP3DX.
+
+    A classe mantem estado entre ciclos para planejar a rota ate o goal
+    corrente, converter o vetor de velocidade em comandos de roda e avancar
+    para o proximo destino confirmado.
+    """
+
+    MAPA_LARGURA_M = 30.0
+    MAPA_ALTURA_M = 30.0
+    MAPA_ORIGEM = (-15.0, -15.0)
+    TAMANHO_CELULA_M = 0.10
+    RAIO_ROBO_M = 0.26
+    MARGEM_SEGURANCA_M = 0.15
+    TOLERANCIA_GOAL_M = 0.10
+    VELOCIDADE_DESEJADA_M_S = 0.50
+
     def __init__(self, id_robo):
+        """Inicializa o agente sem alterar a assinatura exigida pelo TP2.
+
+        Args:
+            id_robo: Identificador um-baseado recebido pelo servidor. O objeto
+                CoppeliaSim correspondente e ``PioneerP3DX[id_robo - 1]``.
+        """
         self.id = id_robo
-    
-        self.robotname = f'PioneerP3DX[{self.id - 1}]'
+        self.robotname = f"PioneerP3DX[{self.id - 1}]"
+        self.L = 0.381
+        self.r = 0.0975
 
-        self.L = 0.381  # Metros
-        self.r = 0.0975 # Metros
-            
+        self._planejador: PlanejadorGlobal | None = None
+        self._sensoriamento = Sensoriamento()
+        self._controlador = Controlador()
+        self._detector_chegada = DetectorDeChegada()
+        self._assinatura_goals: tuple[tuple[float, float], ...] | None = None
+        self._indice_goal = 0
+        self._goal_planejado: tuple[float, float] | None = None
+
     def movement(self, sim, img, goal_list):
+        """Executa um ciclo e informa se o goal corrente foi alcancado."""
+        goals = self._normalizar_goals(goal_list)
+        if not goals:
+            self._parar_rodas(sim)
+            return False
 
-        ## Código placeholder, esse algoritmo não faz nada, apenas desvia para esquerda ou direita 
-        ## Utilize esse código para entender como declarar as variáveis necessárias.
+        self._inicializar_planejador(img)
+        assert self._planejador is not None
+        self._sincronizar_sequencia_goals(goals)
+        if self._indice_goal >= len(goals):
+            self._parar_rodas(sim)
+            return False
 
-        # sim = objeto chave de conexão com o coppelia.
-        # img = visualização da imagem do ambiente. Algoritmos deliberativos irão precisar disso.
-        # goal_list = lista de pontos de interesse a serem visitados no formato [[x1, y1],[x2, y2],[x3, y3],...]
+        goal_atual = goals[self._indice_goal]
+        if goal_atual != self._goal_planejado:
+            self._planejador.definir_goal(goal_atual)
+            self._goal_planejado = goal_atual
 
-        ## O metodo deverá retornar TRUE ao alcançar um dos goals (FALSE caso contrário), lembre-se de chegar o mais perto possível antes de retornar.
-        
-        # Fazendo leitura do laser
-        hokuyo_sensor = HokuyoSensorSim(sim, "/" + self.robotname + "/fastHokuyo")
-        
-        laser_data = hokuyo_sensor.getSensorData()
+        pose = self._sensoriamento.obter_pose(sim, self.robotname)
+        if self._detector_chegada.chegou(
+            pose, goal_atual, tol=self.TOLERANCIA_GOAL_M
+        ):
+            self._parar_rodas(sim)
+            self._indice_goal += 1
+            self._goal_planejado = None
+            if self._indice_goal < len(goals):
+                proximo_goal = goals[self._indice_goal]
+                self._planejador.definir_goal(proximo_goal)
+                self._goal_planejado = proximo_goal
+            return True
 
-        l_wheel = sim.getObject('/' + self.robotname + '/leftMotor')
-        r_wheel = sim.getObject('/' + self.robotname + '/rightMotor')
-    
-        # Velocidade básica (linear, angular)
-        v = 0
-        w = np.deg2rad(0)
+        self._planejador.atualizar(pose)
+        caminho = self._planejador.caminho_completo(pose)
+        waypoint = self._primeiro_waypoint_a_frente(caminho)
+        if waypoint is None:
+            self._parar_rodas(sim)
+            return False
 
-        frente = int(len(laser_data) / 2)
-        lado_direito = int(len(laser_data) * 1 / 4)
-        lado_esquerdo = int(len(laser_data) * 3 / 4)
+        vetor = self._vetor_para_waypoint(pose, waypoint)
+        if vetor is None:
+            self._parar_rodas(sim)
+            return False
+        v, w = self._controlador.controlar(pose, vetor)
+        wl, wr = self._controlador.para_velocidades_roda(v, w, self.L, self.r)
+        self._enviar_velocidades_roda(sim, wl, wr)
+        return False
 
-        # Lógica de desvio de obstáculo
-        if laser_data[frente, 1] > 2:
-            v = .5
-            w = 0
-        elif laser_data[lado_direito, 1] > 2:
-            v = 0
-            w = np.deg2rad(-30)
-        elif laser_data[lado_esquerdo, 1] > 2:
-            v = 0
-            w = np.deg2rad(30)
+    def _inicializar_planejador(self, img: np.ndarray) -> None:
+        """Constroi a grade apenas na primeira chamada de movement."""
+        if self._planejador is not None:
+            return
+        imagem = np.asarray(img)
+        if imagem.ndim < 2 or imagem.shape[0] == 0 or imagem.shape[1] == 0:
+            raise ValueError("img deve conter altura e largura positivas")
 
-        # Modelo cinemático
-        wl = v / self.r - (w * self.L) / (2 * self.r)
-        wr = v / self.r + (w * self.L) / (2 * self.r)
+        escala = (
+            self.MAPA_LARGURA_M / imagem.shape[1],
+            self.MAPA_ALTURA_M / imagem.shape[0],
+        )
+        self._planejador = PlanejadorGlobal(
+            imagem,
+            escala=escala,
+            origem=self.MAPA_ORIGEM,
+            tamanho_celula_m=self.TAMANHO_CELULA_M,
+            raio_robo_m=self.RAIO_ROBO_M,
+            margem_seguranca_m=self.MARGEM_SEGURANCA_M,
+        )
 
-        # Enviando velocidades (não precisa mais de opmode)
-        sim.setJointTargetVelocity(l_wheel, wl)
-        sim.setJointTargetVelocity(r_wheel, wr)
+    def _sincronizar_sequencia_goals(
+        self, goals: tuple[tuple[float, float], ...]
+    ) -> None:
+        """Reinicia o indice somente quando o servidor entrega lista nova."""
+        if goals != self._assinatura_goals:
+            self._assinatura_goals = goals
+            self._indice_goal = 0
+            self._goal_planejado = None
+
+    @staticmethod
+    def _normalizar_goals(
+        goal_list: Iterable[Iterable[float]],
+    ) -> tuple[tuple[float, float], ...]:
+        """Converte goals de entrada para tuplas finitas de coordenadas."""
+        goals: list[tuple[float, float]] = []
+        for indice, goal in enumerate(goal_list):
+            try:
+                x, y = float(goal[0]), float(goal[1])  # type: ignore[index]
+            except (IndexError, TypeError, ValueError) as erro:
+                raise ValueError(
+                    f"goal_list[{indice}] deve conter coordenadas (x, y)"
+                ) from erro
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError(f"goal_list[{indice}] deve conter valores finitos")
+            goals.append((x, y))
+        return tuple(goals)
+
+    @staticmethod
+    def _primeiro_waypoint_a_frente(
+        caminho: list[tuple[float, float]]
+    ) -> tuple[float, float] | None:
+        """Seleciona o proximo waypoint da rota global."""
+        if not caminho:
+            return None
+        return caminho[1] if len(caminho) > 1 else caminho[0]
+
+    def _vetor_para_waypoint(
+        self,
+        pose: tuple[float, float, float],
+        waypoint: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Retorna vetor mundial de modulo controlado, ou None se nulo."""
+        delta_x = waypoint[0] - pose[0]
+        delta_y = waypoint[1] - pose[1]
+        norma = math.hypot(delta_x, delta_y)
+        if norma < 1e-12:
+            return None
+        escala = self.VELOCIDADE_DESEJADA_M_S / norma
+        return delta_x * escala, delta_y * escala
+
+    def _parar_rodas(self, sim) -> None:
+        """Envia velocidade zero aos dois motores do robo deste agente."""
+        self._enviar_velocidades_roda(sim, 0.0, 0.0)
+
+    def _enviar_velocidades_roda(self, sim, wl: float, wr: float) -> None:
+        """Envia velocidades angulares aos motores esquerdo e direito."""
+        motor_esquerdo = sim.getObject(f"/{self.robotname}/leftMotor")
+        motor_direito = sim.getObject(f"/{self.robotname}/rightMotor")
+        if motor_esquerdo == -1 or motor_direito == -1:
+            raise ValueError(f"motores nao encontrados para {self.robotname}")
+        sim.setJointTargetVelocity(motor_esquerdo, float(wl))
+        sim.setJointTargetVelocity(motor_direito, float(wr))
