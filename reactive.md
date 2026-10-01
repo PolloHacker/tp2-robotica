@@ -24,11 +24,15 @@ A arquitetura de navegação do robô combina planejamento global deliberativo (
 +-------------------------+---+               +-------------------+--------------------+
 | - Grid estático inflado     |               | 1. Deteccao obstaculos dinamicos       |
 | - Bloqueios dinâmicos       | <-------------+    - Persistência e expiração          |
-| - Atualização incremental   |  marcar_      | 2. Seleção de lookahead global         |
-| - Caminho suavizado         |  bloqueio     | 3. Vetor atrativo                      |
-+-------------+---------------+               | 4. Campos potenciais repulsivos        |
-              | caminho                       | 5. Quebra determinística de simetria   |
-              +-----------------------------> | 6. Detecção e recuperação de estagnação|
+| - Atualização incremental   |  marcar_      | 2. Filtragem de obstaculos estaticos   |
+| - Caminho suavizado         |  bloqueio     |    - Confianca no caminho D* estatico  |
++-------------+---------------+               | 3. Seleção de lookahead global         |
+              | caminho                       | 4. Vetor atrativo                      |
+              +-----------------------------> | 5. Campos potenciais repulsivos:       |
+                                              |    - Repulsao radial                   |
+                                              |    - Repulsao tangencial (circulacao)  |
+                                              | 6. Quebra determinística de simetria   |
+                                              | 7. Detecção e recuperação de estagnação|
                                               +-------------------+--------------------+
                                                                   |
                                                                   | vetor mundial (vx, vy)
@@ -47,11 +51,12 @@ A arquitetura de navegação do robô combina planejamento global deliberativo (
 ```
 
 A **Camada Reativa** consome `Sensoriamento.obter_laser`, `PlanejadorGlobal.caminho_completo` e alimenta `Controlador.controlar`, garantindo que:
-1. O robô reaja a tempo contra obstáculos estáticos próximos e robôs móveis.
-2. Não haja colisões frontais por indecisão (quebra de simetria à direita).
-3. Obstáculos dinâmicos observados com consistência sejam inseridos no grid D* Lite para desvio deliberativo de longo alcance.
-4. Obstáculos dinâmicos que desocupem a área sejam liberados por histerese/expiração.
-5. Travamentos em cantos ou becos sejam detectados e desfeitos por manobras de recuperação (recuo e giro), sem confundir curvas lentas com estagnação.
+1. O robô confie e siga estritamente o caminho ótimo do D* Lite contra obstáculos estáticos, sem sofrer repulsões desnecessárias de paredes conhecidas.
+2. Obstáculos dinâmicos no campo do laser acionem campos potenciais repulsivos radiais e tangenciais para desvio rápido e contorno ágil.
+3. Não haja colisões frontais por indecisão (quebra de simetria à direita e circulação tangencial orientada ao goal).
+4. Obstáculos dinâmicos observados com consistência sejam inseridos no grid D* Lite para desvio deliberativo de longo alcance.
+5. Obstáculos dinâmicos que desocupem a área sejam liberados por histerese/expiração.
+6. Travamentos em cantos ou becos sejam detectados e desfeitos por manobras de recuperação (recuo e giro), sem confundir curvas lentas com estagnação.
 
 ---
 
@@ -92,7 +97,36 @@ Para evitar viés de densidade de feixes (uma parede plana de 100 feixes geraria
    Se $\|\vec{F}_{rep}\| > f_{rep\_max}$ ($0,65\text{ m/s}$), o vetor é saturado:
    $$\vec{F}_{rep} \leftarrow f_{rep\_max} \cdot \frac{\vec{F}_{rep}}{\|\vec{F}_{rep}\|}$$
 
-### 2.3. Quebra Determinística de Simetria (Desvio à Direita)
+### 2.3. Repulsão Tangencial (Circulação em Torno de Obstáculos Dinâmicos)
+
+A repulsão radial clássica atua apenas empurrando o robô para trás quando o obstáculo está à sua frente, o que pode reduzir a velocidade a quase zero ou causar oscilação prolongada.
+
+Para permitir que o robô **contorne obstáculos dinâmicos muito mais rápido**, implementou-se a **repulsão tangencial** (campo circulatório/vórtice):
+
+1. **Direções ortogonais:** Para cada setor com ângulo mundial $\phi_s$, os vetores unitários perpendiculares à direção do obstáculo são:
+   $$\hat{u}_{tan, dir} = \begin{bmatrix} \sin\phi_s \\ -\cos\phi_s \end{bmatrix} \quad (\text{girado } -90^\circ, \text{à direita do obstáculo})$$
+   $$\hat{u}_{tan, esq} = \begin{bmatrix} -\sin\phi_s \\ \cos\phi_s \end{bmatrix} \quad (\text{girado } +90^\circ, \text{à esquerda do obstáculo})$$
+
+2. **Orientação alinhada ao goal:** A direção $\hat{u}_{tan}$ é selecionada maximizando o produto escalar com o vetor de atração $\vec{v}_{att}$ do lookahead:
+   $$\text{Se } \vec{v}_{att} \cdot \hat{u}_{tan, esq} > \vec{v}_{att} \cdot \hat{u}_{tan, dir} \implies \hat{u}_{tan} = \hat{u}_{tan, esq}$$
+   $$\text{Caso contrário (incluindo empate/colineariedade frontal)} \implies \hat{u}_{tan} = \hat{u}_{tan, dir}$$
+
+3. **Magnitude e acúmulo:**
+   $$F_{tan, s} = k_{tan} \left( \frac{1}{d_{ef}} - \frac{1}{d_{inf}} \right) \cdot \frac{1}{d_{ef}} \quad (k_{tan} = 0,30)$$
+   $$\vec{F}_{tan} = \sum_{s} F_{tan, s} \cdot \hat{u}_{tan, s}$$
+   Saturado em $f_{rep\_max}$ caso a norma exceda o limite.
+
+### 2.4. Filtragem de Obstáculos Estáticos e Confiança no Caminho D*
+
+O planejador deliberativo D* Lite calcula a rota ótima com folga de segurança inflada ($R_{robo} + M_{seg} = 0,41\text{ m}$) contra todas as paredes estáticas da imagem do mapa. Se o campo potencial atuasse também contra paredes estáticas, o robô seria empurrado lateralmente em corredores ou impedido de dobrar esquinas planejadas pelo D*.
+
+Portanto, a camada reativa implementa a regra: **o robô acredita no caminho D* para obstáculos estáticos, realizando alterações apenas para obstáculos dinâmicos**.
+
+1. O método [`PlanejadorGlobal.eh_obstaculo_estatico`](src/Agente1.py) verifica se uma coordenada mundial $(x_w, y_w)$ incide sobre uma parede estática ou sua vizinhança imediata de discretização ($\le 0,145\text{ m}$).
+2. O método [`CamadaReativa.filtrar_laser_dinamico`](src/Agente1.py) descarta todos os feixes refletidos em paredes estáticas, isolando apenas os pontos correspondentes a robôs móveis ou caixas dinâmicas.
+3. As forças repulsiva radial $\vec{F}_{rep}$, tangencial $\vec{F}_{tan}$, de quebra de simetria $\vec{F}_{sym}$ e a modulação frontal de velocidade atuam **exclusivamente** sobre leituras dinâmicas. Na ausência de obstáculos dinâmicos, o robô segue a rota global com desvio zero.
+
+### 2.5. Quebra Determinística de Simetria (Desvio à Direita)
 
 Em encontros frontais colineares (dois robôs se aproximando frente a frente), $\vec{v}_{att}$ e $\vec{F}_{rep}$ tornam-se opostos e colineares, criando um ponto de sela / deadlock.
 
@@ -106,12 +140,12 @@ Adota-se uma regra determinística baseada na convenção náutica/aérea (COLRE
    Onde $\hat{u}_{direita}$ é o vetor unitário ortogonal à direita do chassi no mundo:
    $$\hat{u}_{direita} = \begin{bmatrix} \sin\theta \\ -\cos\theta \end{bmatrix}$$
 
-### 2.4. Combinação dos Vetores de Velocidade
+### 2.6. Combinação dos Vetores de Velocidade
 
-Os três vetores são somados no espaço de estados mundial:
-$$\vec{v}_{tot} = \vec{v}_{att} + \vec{F}_{rep} + \vec{F}_{sym}$$
+Os quatro vetores são somados no espaço de estados mundial:
+$$\vec{v}_{tot} = \vec{v}_{att} + \vec{F}_{rep} + \vec{F}_{tan} + \vec{F}_{sym}$$
 
-Se houver obstáculo frontal a menos de $0,50\text{ m}$, a velocidade desejada é modulada para dar tempo à rotação:
+Se houver obstáculo dinâmico frontal a menos de $0,50\text{ m}$, a velocidade desejada é modulada para dar tempo à rotação:
 $$v_{alvo} = \max\left(0,18, \; v_{des} \cdot \frac{d_{front\_min}}{0,50}\right)$$
 
 O vetor resultante final é normalizado para $v_{alvo}$:
@@ -196,6 +230,7 @@ $$v_y = \sin\theta \cdot v + d_c \cos\theta \cdot w$$
 | `raio_influencia_laser_m` | `0,90 m` | Obstáculos a mais de 90 cm não interferem na trajetória em corredores normais. |
 | `distancia_saturacao_m` | `0,32 m` | Folga ligeiramente superior ao raio do casco ($0,26\text{ m}$) para evitar forças infinitas. |
 | `ganho_repulsao` | `0,35` | Balanço ideal entre desvio de paredes e atração ao goal. |
+| `ganho_tangencial` | `0,30` | Força tangencial circulatória para contorno rápido de obstáculos dinâmicos. |
 | `ganho_simetria` | `0,30` | Força lateral suficiente para deflexão preventiva à direita em encontros frontais. |
 | `f_rep_max` | `0,65 m/s` | Casado com a velocidade linear máxima $v_{max}$ do controlador. |
 | `angulo_frontal_rad` | `±30°` | Setor frontal crítico para detecção de colisões iminentes. |
@@ -211,15 +246,15 @@ $$v_y = \sin\theta \cdot v + d_c \cos\theta \cdot w$$
 
 ## 6. Validação por Testes Automatizados
 
-A suíte em [`tests/test_camada_reativa.py`](tests/test_camada_reativa.py) contém **26 testes unitários e de integração**, executáveis via:
+A suíte em [`tests/test_camada_reativa.py`](tests/test_camada_reativa.py) contém **37 testes unitários e de integração**, executáveis via:
 
 ```bash
-python -m unittest discover tests
+uv run python -m unittest discover tests
 ```
 
 ### 6.1. Casos de Teste Cobertos
 
-1. **Campos Potenciais Repulsivos (`TestPotencialRepulsao`):**
+1. **Campos Potenciais Repulsivos Radiais (`TestPotencialRepulsao`):**
    - `test_sem_leituras_laser`: força nula se laser vazio ou None.
    - `test_obstaculo_alem_raio_influencia`: ausência de força para $d \ge 0,90\text{ m}$.
    - `test_repulsao_frontal`: empurrão exclusivamente para trás (direção $-x$) com obstáculo em $\alpha = 0$.
@@ -227,40 +262,92 @@ python -m unittest discover tests
    - `test_repulsao_lateral_direita`: empurrão para trás e para a esquerda ($+y$) com obstáculo a $-45^\circ$.
    - `test_saturacao_muito_proximo`: magnitude finita e limitada a `f_rep_max` para distâncias quase nulas.
 
-2. **Quebra de Simetria (`TestQuebraDeSimetria`):**
+2. **Repulsão Tangencial Circulatória (`TestRepulsaoTangencial`):**
+   - `test_sem_leituras_laser`: força nula se laser vazio.
+   - `test_obstaculo_alem_raio_influencia`: ausência de força fora de $0,90\text{ m}$.
+   - `test_obstaculo_frontal_desvia_direita`: empurrão tangencial prioritário à direita ($-y$) para obstáculo frontal.
+   - `test_obstaculo_lateral_esquerda_circula_direita`: empurrão com avanço ($+x$) e curvatura à direita ($-y$) contornando obstáculo à esquerda.
+   - `test_obstaculo_lateral_direita_circula_esquerda`: empurrão com avanço ($+x$) e curvatura à esquerda ($+y$) contornando obstáculo à direita.
+   - `test_saturacao_f_rep_max`: magnitude saturada em `f_rep_max` em distâncias muito pequenas.
+
+3. **Filtragem de Estáticos e Confiança no D* (`TestFiltroEstaticoEAcreditarDStar`):**
+   - `test_reconhecimento_obstaculo_estatico`: mapeamento correto de pontos sobre paredes como estáticos e áreas livres como dinâmicos.
+   - `test_filtrar_laser_descarta_parede_estatica`: descarte de feixes refletidos em paredes estáticas conhecidas.
+   - `test_filtrar_laser_preserva_obstaculo_dinamico`: preservação integral de feixes em espaço livre (outro robô móvel).
+   - `test_robo_acredita_no_caminho_dstar_junto_a_parede`: robô seguindo rota D* ao lado de parede estática não sofre desvio repulsivo, mantendo direção exata do lookahead D*.
+   - `test_desvio_ocorre_somente_para_obstaculo_dinamico`: cenário com parede e obstáculo dinâmico em que o desvio reativo ocorre exclusivamente em resposta ao obstáculo dinâmico.
+
+4. **Quebra de Simetria (`TestQuebraDeSimetria`):**
    - `test_encontro_frontal_prioriza_direita`: geração de componente lateral à direita ($-y$) com $\theta = 0$.
    - `test_encontro_frontal_orientacao_diferente`: geração de componente lateral à direita ($+x$) com $\theta = \pi/2$.
    - `test_obstaculo_fora_do_cone_frontal`: sem viés lateral para obstáculos fora dos $\pm 30^\circ$.
 
-3. **Lookahead e Atração (`TestLookaheadEAtracao`):**
+5. **Lookahead e Atração (`TestLookaheadEAtracao`):**
    - `test_selecao_lookahead`: seleção do waypoint à distância $\ge 0,60\text{ m}$ à frente no caminho.
    - `test_lookahead_proximo_ao_goal`: seleção do próprio goal quando a menos de $0,60\text{ m}$ do fim.
    - `test_caminho_vazio`: retorno `None` para caminhos vazios.
    - `test_calculo_atracao`: cálculo de vetor atrativo unitário escalado para $v_{desejada}$.
 
-4. **Detecção Dinâmica e Histerese (`TestDeteccaoObstaculosDinamicos`):**
+6. **Detecção Dinâmica e Histerese (`TestDeteccaoObstaculosDinamicos`):**
    - `test_persistencia_necessaria_para_bloqueio`: não bloqueia nos passos 1 e 2; bloqueia no passo 3.
    - `test_expiracao_e_desbloqueio`: mantém bloqueado durante histerese e libera automaticamente no passo 16.
    - `test_replanejamento_apos_bloqueio_e_desbloqueio`: verifica que o D* Lite encontra desvio contornando a célula bloqueada dinamicamente e restabelece a rota curta original assim que a célula expira.
 
-5. **Estagnação e Recuperação (`TestEstagnacaoERecuperacao`):**
+7. **Estagnação e Recuperação (`TestEstagnacaoERecuperacao`):**
    - `test_deteccao_estagnacao_e_recuperacao`: ativação no 5º ciclo parado, sequência `RECUO` ($v < 0$) $\to$ `GIRO` ($w < 0$) $\to$ retorno a `NORMAL`.
    - `test_nao_confunde_curva_ou_giro_com_estagnacao`: rotação ativa com $\Delta\theta > 0,20\text{ rad}$ não dispara estagnação.
    - `test_nao_ativa_estagnacao_se_estiver_no_goal`: robô dentro da tolerância do goal não entra em recuperação.
 
-6. **Composição Vetorial (`TestCombinacaoVetorDesejado`):**
+8. **Composição Vetorial (`TestCombinacaoVetorDesejado`):**
    - `test_combinacao_livre_segue_lookahead`: vetor idêntico ao lookahead em espaço livre.
    - `test_combinacao_com_obstaculo_lateral_esquerda`: deflexão lateral à direita com componente de avanço preservado.
    - `test_combinacao_frontal_aplica_desvio_direita`: quebra de simetria desloca vetor para a direita em encontro frontal.
    - `test_modulacao_velocidade_obstaculo_muito_proximo`: redução automática de velocidade em distâncias $< 0,50\text{ m}$.
 
-7. **Integração com `Agent` (`TestIntegracaoAgent`):**
+9. **Integração com `Agent` (`TestIntegracaoAgent`):**
    - `test_inicializacao_agente`: instanciação correta dos módulos na classe `Agent`.
    - `test_ciclo_movement_com_mock`: ciclo completo de sensoriamento, planejamento, reatividade e envio de comandos de roda aos motores.
    - `test_chegada_ao_goal_retorna_true`: validação do contrato booleano e parada das rodas ao alcançar o objetivo.
 
 ### 6.2. Resultado da Execução
 ```text
-Ran 26 tests in 0.336s
+Ran 42 tests in 1.460s
 OK
 ```
+---
+## 7. Visualizador em Tempo Real & Painel de Telemetria de Decisões
+Para atender ao requisito de transparência e inspeção em tempo real das decisões de planejamento e navegação do robô, foram introduzidas as classes [`TelemetriaDecisao`](src/Agente1.py) e [`VisualizadorNavegacao`](src/Agente1.py).
+### 7.1. Como Habilitar a Visualização
+A janela separada pode ser ativada de três formas transparentes:
+1. **Parâmetro de inicialização:** `agente = Agent(id_robo=1, visualizar=True)`
+2. **Método dinâmico:** `agente.habilitar_visualizacao(True)`
+3. **Variável de ambiente:** `export TP2_VISUALIZAR=1` (permite visualizar qualquer execução sem alterar código)
+### 7.2. Painéis da Janela Gráfica
+A janela interativa possui layout 2x2 otimizado (sub-15 ms por quadro, não bloqueante para a simulação):
+1. **Painel Esquerdo — Visão Global (30 m x 30 m):**
+- Grid de ocupação estático inflado do D* Lite (paredes conhecidas em cinza escuro/médio).
+- Células dinamicamente bloqueadas exibidas em vermelho vivo (`#dc2626`).
+- Rota global ótima do D* Lite (linha tracejada laranja `#ea580c`).
+- Trajetória percorrida pelo robô (linha contínua azul `#2563eb`).
+- Goals pendentes (estrelas vermelhas numeradas G1, G2, etc.) e goals alcançados (estrelas verdes).
+- Marcador de pose do robô em roxo (`#7c3aed`).
+2. **Painel Superior Direito — Visão Ego Local do Robô (Zoom 5 m x 5 m):**
+- Casco circular do Pioneer P3-DX ($R = 0,26\text{ m}$) e margem de segurança inflada ($R = 0,41\text{ m}$).
+- Vetor de orientação da proa ($\theta$).
+- Feixes do sensor laser Hokuyo classificados:
+- **Cinza:** leituras coincidentes com paredes estáticas (ignoradas pelo APF para manter fidelidade ao D*).
+- **Vermelho vivo:** leituras correspondentes a obstáculos dinâmicos ativos.
+- Waypoint de lookahead selecionado no caminho (cruz ciano).
+- **Vetores de Força em Tempo Real (Quivers):**
+- $\vec{v}_{att}$ (Verde): Atração ao waypoint do caminho D*.
+- $\vec{F}_{rep}$ (Vermelho): Repulsão radial contra obstáculos dinâmicos.
+- $\vec{F}_{tan}$ (Magenta): Repulsão tangencial de circulação rápida (contorno ágil).
+- $\vec{F}_{sym}$ (Ouro): Força determinística de quebra de simetria à direita.
+- $\vec{v}_{des}$ (Azul Escuro): Comando vetorial total enviado ao controlador de rastreamento.
+3. **Painel Inferior Direito — HUD de Telemetria e Diagnóstico:**
+- Terminal monocromático estilizado de alto contraste (`#0f172a`).
+- Estado da máquina de navegação (`NORMAL`, `RECUO`, `GIRO`).
+- Meta ativa ($G_k$), coordenadas mundiais e distância euclidiana instantânea.
+- Velocidades em tempo real: $v$ linear, $\omega$ angular e comandos de motor $w_l, w_r$.
+- Intensidades exatas de todas as forças reativas ativas ($\|v_{att}\|, \|F_{rep}\|, \|F_{tan}\|, \|F_{sym}\|, \|v_{des}\| drive$).
+- Contagem de feixes dinâmicos, células bloqueadas ativas no D* e número de waypoints restantes.

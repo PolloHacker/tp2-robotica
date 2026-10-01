@@ -32,30 +32,44 @@ a mesma lista integral para `Agent.movement(...)` a cada ciclo:
 Implementada na classe `CamadaReativa` em `src/Agente1.py` e integrada ao ciclo
 `Agent.movement(...)`, consumindo `Sensoriamento.obter_laser`,
 `PlanejadorGlobal.caminho_completo` e `Controlador.controlar`. Totalmente coberta
-por 26 testes automatizados em `tests/test_camada_reativa.py`.
+por 42 testes automatizados em `tests/test_camada_reativa.py`.
 
-- **Repulsao por campos potenciais:** calculada via `calcular_repulsao` a partir
-  de `(angulo, distancia)` do laser, agrupada em setores angulares para evitar
-  viés de contagem de feixes, com raio de influencia (`raio_influencia_laser_m = 0.90 m`)
-  e saturacao proxima ao robo (`distancia_saturacao_m = 0.32 m`, saturada em `f_rep_max`).
-- **Lookahead e combinacao:** `selecionar_lookahead` seleciona waypoint a frente
-  no caminho global (`distancia_lookahead_m = 0.60 m`). Atracao, repulsao e
-  desvio lateral sao combinados em `calcular_vetor_desejado` em um unico vetor
-  `(vx, vy)` enviado a `Controlador.controlar`.
-- **Deteccao e persistencia de obstaculos dinamicos:** `processar_obstaculos_dinamicos`
-  converte coordenadas de impacto no espaco livre estatico para celulas do grid e
-  chama `planejador.marcar_bloqueio(celulas, True)` apos persistencia (`passos_persistencia = 3`).
-- **Histerese e expiracao:** celulas bloqueadas dinamicamente sao automaticamente
-  liberadas via `planejador.marcar_bloqueio(celulas, False)` quando nao mais
-  observadas apos tempo de expiracao (`passos_expiracao = 15`).
-- **Deteccao de estagnacao e recuperacao:** `monitorar_estagnacao` monitora o
-  deslocamento e variacao angular em uma janela temporal (`janela_estagnacao_passos = 20`);
+- **Visualizador em tempo real e telemetria de decisões:** `VisualizadorNavegacao`
+  e `TelemetriaDecisao` fornecem uma janela interativa separada exibindo em tempo
+  real a visão global (grid D*, rota planejada, trajetória e goals), a visão ego local
+  (casco do robô, feixes laser dinâmicos e estáticos, e quivers de todas as forças APF
+  atuantes: atração, repulsão radial, repulsão tangencial e quebra de simetria) e um HUD
+  completo de telemetria em monospace. Ativável por `visualizar=True`, `habilitar_visualizacao()`
+  ou `TP2_VISUALIZAR=1`.
+
+- **Confiança no caminho D* e filtragem estática:** `filtrar_laser_dinamico` e
+  `eh_obstaculo_estatico` identificam e descartam leituras incidentes em paredes do
+  mapa original, garantindo que o robô siga fielmente a rota D* Lite sem repulsão
+  de paredes estáticas, realizando desvios reativos exclusivamente para obstáculos dinâmicos.
+- **Repulsão radial e tangencial por campos potenciais:**
+  - Repulsão radial via `calcular_repulsao` (`ganho_repulsao = 0.35`).
+  - Repulsão tangencial circulatória via `calcular_repulsao_tangencial`
+    (`ganho_tangencial = 0.30`), orientada para maximizar o alinhamento com a
+    atração ao goal/lookahead, permitindo contornar robôs e obstáculos móveis
+    com muito mais rapidez e sem perda desnecessária de velocidade linear.
+- **Lookahead e combinação:** `selecionar_lookahead` seleciona waypoint à frente
+  no caminho global (`distancia_lookahead_m = 0.60 m`). Atração, repulsão radial,
+  repulsão tangencial e quebra de simetria são combinados em `calcular_vetor_desejado`
+  em um único vetor `(vx, vy)` enviado a `Controlador.controlar`.
+- **Detecção e persistência de obstáculos dinâmicos:** `processar_obstaculos_dinamicos`
+  converte coordenadas de impacto no espaço livre estático para células do grid e
+  chama `planejador.marcar_bloqueio(celulas, True)` após persistência (`passos_persistencia = 3`).
+- **Histerese e expiração:** células bloqueadas dinamicamente são automaticamente
+  liberadas via `planejador.marcar_bloqueio(celulas, False)` quando não mais
+  observadas após tempo de expiração (`passos_expiracao = 15`).
+- **Detecção de estagnação e recuperação:** `monitorar_estagnacao` monitora o
+  deslocamento e variação angular em uma janela temporal (`janela_estagnacao_passos = 20`);
   detecta travamento sem confundir curvas lentas ou giros no eixo (distinguindo
-  pela taxa de variacao de theta), acionando maquina de estados de recuperacao
+  pela taxa de variação de theta), acionando máquina de estados de recuperação
   composta por recuo (`ESTADO_RECUO`, v < 0) e giro (`ESTADO_GIRO`, w < 0).
-- **Quebra deterministica de simetria:** `calcular_quebra_simetria` adiciona
-  componente lateral a direita (`u_direita = (sin theta, -cos theta)`) em
-  encontros frontais (|angulo| <= 30 deg), prevenindo deadlocks colineares.
+- **Quebra determinística de simetria:** `calcular_quebra_simetria` adiciona
+  componente lateral à direita (`u_direita = (sin theta, -cos theta)`) em
+  encontros frontais (|ângulo| <= 30 deg), prevenindo deadlocks colineares.
 
 ### 2. Calibracao na cena real
 

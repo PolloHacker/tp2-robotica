@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import heapq
+import os
+from dataclasses import dataclass
 from numbers import Real
 from typing import Iterable, TypeAlias
 
@@ -42,6 +44,7 @@ class PlanejadorGlobal:
         tamanho_celula_m: float = 0.10,
         raio_robo_m: float = 0.26,
         margem_seguranca_m: float = 0.15,
+        raio_inflacao_dinamica_m: float | None = None,
     ) -> None:
         self.escala_x_m_por_pixel, self.escala_y_m_por_pixel = (
             self._normalizar_escala(escala)
@@ -63,12 +66,28 @@ class PlanejadorGlobal:
         self.cols = math.ceil(self.largura_m / self.tamanho_celula_m)
 
         ocupacao_base = self._agrupar_pixels_em_grid(pixels_ocupados)
+        self.ocupacao_base = ocupacao_base.copy()
         raio_inflacao = self.raio_robo_m + self.margem_seguranca_m
         self.ocupacao_estatica = self._inflar_obstaculos(
             ocupacao_base, raio_inflacao
         )
+        self.ocupacao_estatica_parede = self._inflar_obstaculos(
+            ocupacao_base, self.tamanho_celula_m * 1.45
+        )
         self.ocupacao_dinamica = np.zeros_like(self.ocupacao_estatica, dtype=bool)
         self.ocupacao = self.ocupacao_estatica.copy()
+        self._contagem_bloqueio_dinamico = np.zeros_like(
+            self.ocupacao_estatica, dtype=np.int32
+        )
+        if raio_inflacao_dinamica_m is not None:
+            self.raio_inflacao_dinamica_m = float(raio_inflacao_dinamica_m)
+        else:
+            self.raio_inflacao_dinamica_m = float(
+                self.raio_robo_m + min(self.margem_seguranca_m, 0.12)
+            )
+        self._deltas_inflacao_dinamica: list[tuple[int, int]] = (
+            self._precomputar_deltas_inflacao(self.raio_inflacao_dinamica_m)
+        )
 
         # Estado D* Lite. Os dicionarios sao esparsos: ausencia equivale a inf.
         self.g: dict[Cell, float] = {}
@@ -227,6 +246,16 @@ class PlanejadorGlobal:
                 ]
         return inflada
 
+    def _precomputar_deltas_inflacao(self, raio_m: float) -> list[tuple[int, int]]:
+        """Precomputa deltas relativos (dr, dc) para inflacao circular de raio informado."""
+        alcance = math.ceil(raio_m / self.tamanho_celula_m)
+        deltas: list[tuple[int, int]] = []
+        for dr in range(-alcance, alcance + 1):
+            for dc in range(-alcance, alcance + 1):
+                if math.hypot(dr, dc) * self.tamanho_celula_m <= raio_m + 1e-12:
+                    deltas.append((dr, dc))
+        return deltas
+
     def mundo_para_celula(self, ponto_xy: WorldPoint) -> Cell | None:
         """Converte ``(x, y)`` mundial para ``(linha, coluna)`` ou ``None``.
 
@@ -251,6 +280,19 @@ class PlanejadorGlobal:
             self.origem[0] + (coluna + 0.5) * self.tamanho_celula_m,
             self.origem[1] + (self.rows - linha - 0.5) * self.tamanho_celula_m,
         )
+
+    def eh_obstaculo_estatico(self, ponto_xy: WorldPoint) -> bool:
+        """Informa se a coordenada mundial (x, y) coincide com obstaculo estatico (parede).
+
+        Considera estaticos os pontos que caem dentro de paredes do mapa original
+        ou em sua vizinhanca imediata (~1 celula de tolerancia de discretizacao),
+        alem de pontos fora dos limites do mapa.
+        """
+        celula = self.mundo_para_celula(ponto_xy)
+        if celula is None:
+            return True
+        linha, coluna = celula
+        return bool(self.ocupacao_estatica_parede[linha, coluna])
 
     def definir_goal(self, goal_xy: WorldPoint) -> None:
         """Reinicializa D* Lite para o novo goal mundial ``(x, y)``.
@@ -278,36 +320,71 @@ class PlanejadorGlobal:
         self._inserir_fila(goal)
         self._replanejamento_pendente = True
 
-    def marcar_bloqueio(self, celulas: list[Cell], bloqueado: bool) -> None:
-        """Marca ou libera celulas dinamicas no grid.
+    def marcar_bloqueio(
+        self, celulas: list[Cell], bloqueado: bool, inflar: bool = True
+    ) -> None:
+        """Marca ou libera celulas dinamicas no grid com inflacao e contagem de referencia.
 
         Args:
             celulas: Lista de indices ``(linha, coluna)`` do grid. Celulas fora
                 do mapa sao ignoradas para tornar a fronteira com sensores
                 segura.
             bloqueado: ``True`` adiciona um obstaculo dinamico; ``False`` o
-                remove. Paredes estaticas infladas nunca sao removidas.
-
-        A propagacao D* Lite ocorre em ``atualizar``. Assim, varias mudancas no
-        mesmo ciclo produzem uma unica busca incremental.
+                remove e decrementa contagens de referencia. Paredes estaticas
+                infladas nunca sao removidas.
+            inflar: Se ``True``, infla pelo raio de colisao do robo para fechar
+                frestas estreitas e intransitaveis no grid do D*.
         """
         if not isinstance(bloqueado, (bool, np.bool_)):
             raise ValueError("bloqueado deve ser booleano")
 
-        for celula in celulas:
-            if not self._celula_valida(celula):
+        deltas = self._deltas_inflacao_dinamica if inflar else [(0, 0)]
+        celulas_afetadas: set[Cell] = set()
+
+        for celula_centro in celulas:
+            if not self._celula_valida(celula_centro):
                 continue
-            linha, coluna = celula
-            # Uma parede estatica ja esta ocupada, portanto marca dinamica nao
-            # acrescenta informacao e uma liberacao jamais a afeta.
+            cr, cc = celula_centro
+            for dr, dc in deltas:
+                r, c = cr + dr, cc + dc
+                if 0 <= r < self.rows and 0 <= c < self.cols:
+                    celulas_afetadas.add((r, c))
+
+        for linha, coluna in celulas_afetadas:
+            # Uma parede estatica ja esta permanentemente ocupada.
             if self.ocupacao_estatica[linha, coluna]:
                 continue
-            novo_valor = bool(bloqueado)
-            if self.ocupacao_dinamica[linha, coluna] == novo_valor:
-                continue
-            self.ocupacao_dinamica[linha, coluna] = novo_valor
-            self.ocupacao[linha, coluna] = novo_valor
-            self._celulas_dinamicas_pendentes.add(celula)
+
+            if bloqueado:
+                # Nao bloqueia a celula onde o robo ou o goal estao agora
+                if (linha, coluna) == self.start or (linha, coluna) == self.goal:
+                    continue
+                if self._contagem_bloqueio_dinamico[linha, coluna] == 0:
+                    self.ocupacao_dinamica[linha, coluna] = True
+                    self.ocupacao[linha, coluna] = True
+                    self._celulas_dinamicas_pendentes.add((linha, coluna))
+                    self._replanejamento_pendente = True
+                self._contagem_bloqueio_dinamico[linha, coluna] += 1
+            else:
+                if self._contagem_bloqueio_dinamico[linha, coluna] > 0:
+                    self._contagem_bloqueio_dinamico[linha, coluna] -= 1
+                    if self._contagem_bloqueio_dinamico[linha, coluna] == 0:
+                        self.ocupacao_dinamica[linha, coluna] = False
+                        self.ocupacao[linha, coluna] = bool(
+                            self.ocupacao_estatica[linha, coluna]
+                        )
+                        self._celulas_dinamicas_pendentes.add((linha, coluna))
+                        self._replanejamento_pendente = True
+
+    def limpar_obstaculos_dinamicos(self) -> None:
+        """Remove todos os obstaculos dinamicos e restaura ocupacao estatica."""
+        linhas, colunas = np.where(self.ocupacao_dinamica)
+        for r, c in zip(linhas, colunas):
+            self.ocupacao_dinamica[r, c] = False
+            self.ocupacao[r, c] = bool(self.ocupacao_estatica[r, c])
+            self._celulas_dinamicas_pendentes.add((int(r), int(c)))
+        self._contagem_bloqueio_dinamico.fill(0)
+        if len(linhas) > 0:
             self._replanejamento_pendente = True
 
     def atualizar(self, pose_atual: tuple[float, float, float]) -> None:
@@ -344,31 +421,76 @@ class PlanejadorGlobal:
         self._compute_shortest_path()
         self._replanejamento_pendente = False
 
+    def _encontrar_celula_livre_proxima(
+        self, celula_origem: Cell, max_raio: int = 6
+    ) -> Cell | None:
+        """Busca por BFS a celula livre mais proxima caso start caia na margem inflada."""
+        from collections import deque
+
+        fila = deque([celula_origem])
+        visitados = {celula_origem}
+        while fila:
+            r, c = fila.popleft()
+            if not self.ocupacao[r, c] and math.isfinite(self._g((r, c))):
+                return (r, c)
+            for dr, dc in [
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+                (1, -1),
+                (1, 1),
+            ]:
+                nr, nc = r + dr, c + dc
+                if (
+                    0 <= nr < self.rows
+                    and 0 <= nc < self.cols
+                    and (nr, nc) not in visitados
+                    and abs(nr - celula_origem[0]) <= max_raio
+                    and abs(nc - celula_origem[1]) <= max_raio
+                ):
+                    visitados.add((nr, nc))
+                    fila.append((nr, nc))
+        return None
+
     def caminho_completo(
         self, pose_atual: tuple[float, float, float]
     ) -> list[WorldPoint]:
         """Retorna caminho mundial suavizado entre pose e goal, ou ``[]``.
 
         A lista inclui o centro da celula inicial e termina na coordenada exata
-        passada a ``definir_goal``. A estrategia de navegacao pode escolher
-        qualquer waypoint da lista para compor seu vetor de velocidade.
+        passada a ``definir_goal``. Se o robo tangenciou momentaneamente a
+        margem inflada de uma parede, busca a celula livre mais proxima para
+        restituir o vetor de navegacao para fora da quina.
         """
         if self.goal is None or self.goal_xy is None:
             return []
         self.atualizar(pose_atual)
-        if (
-            self.start is None
-            or self.ocupacao[self.start]
-            or self.ocupacao[self.goal]
-            or math.isinf(self._g(self.start))
-        ):
+        if self.start is None or self.ocupacao[self.goal]:
             return []
 
-        caminho_celulas = self._extrair_caminho_celulas()
+        start_planejamento = self.start
+        estava_em_margem = False
+        if self.ocupacao[start_planejamento]:
+            start_livre = self._encontrar_celula_livre_proxima(start_planejamento)
+            if start_livre is not None:
+                start_planejamento = start_livre
+                estava_em_margem = True
+            else:
+                return []
+
+        if math.isinf(self._g(start_planejamento)):
+            return []
+
+        caminho_celulas = self._extrair_caminho_celulas(start_planejamento)
         if not caminho_celulas:
             return []
         caminho_suavizado = self._suavizar_caminho(caminho_celulas)
         caminho = [self.celula_para_mundo(celula) for celula in caminho_suavizado]
+        if estava_em_margem:
+            caminho.insert(0, (float(pose_atual[0]), float(pose_atual[1])))
         caminho[-1] = self.goal_xy
         return caminho
 
@@ -520,11 +642,12 @@ class PlanejadorGlobal:
                 for predecessor in self._vizinhos(vertice):
                     self._atualizar_vertice(predecessor)
 
-    def _extrair_caminho_celulas(self) -> list[Cell]:
-        """Segue o sucessor de menor ``custo + g`` do start ate o goal."""
-        if self.start is None or self.goal is None:
+    def _extrair_caminho_celulas(self, inicio: Cell | None = None) -> list[Cell]:
+        """Segue o sucessor de menor ``custo + g`` do start (ou inicio) ate o goal."""
+        celula_inicial = self.start if inicio is None else inicio
+        if celula_inicial is None or self.goal is None:
             return []
-        atual = self.start
+        atual = celula_inicial
         caminho = [atual]
         visitadas = {atual}
         while atual != self.goal:
@@ -790,6 +913,16 @@ class Controlador:
         seno = math.sin(theta)
         v = cosseno * vx + seno * vy
         w = (-seno * vx + cosseno * vy) / self.distancia_controle_m
+
+        # Modulacao de velocidade em curvas para evitar subestercamento contra quinas
+        angulo_desejado = math.atan2(vy, vx)
+        diff_ang = abs(
+            (angulo_desejado - theta + math.pi) % (2.0 * math.pi) - math.pi
+        )
+        if diff_ang > math.radians(20.0):
+            fator_curva = max(0.12, math.cos(diff_ang) ** 2)
+            v *= fator_curva
+
         return (
             float(np.clip(v, -self.v_max_m_s, self.v_max_m_s)),
             float(np.clip(w, -self.w_max_rad_s, self.w_max_rad_s)),
@@ -840,6 +973,29 @@ class DetectorDeChegada:
         )
 
 
+@dataclass
+class TelemetriaDecisao:
+    """Registra o estado instantaneo das decisoes do planejador e camada reativa."""
+
+    pose: tuple[float, float, float]
+    caminho: list[WorldPoint]
+    goal: WorldPoint
+    lookahead: WorldPoint | None
+    laser_bruto: np.ndarray
+    laser_dinamico: np.ndarray
+    v_att: tuple[float, float]
+    f_rep: tuple[float, float]
+    f_tan: tuple[float, float]
+    f_sym: tuple[float, float]
+    v_tot: tuple[float, float]
+    v_desejado: tuple[float, float] | None
+    estado_recuperacao: int
+    v_linear: float = 0.0
+    w_angular: float = 0.0
+    wl: float = 0.0
+    wr: float = 0.0
+
+
 class CamadaReativa:
     """Camada reativa dinamica para desvio de obstaculos e navegacao local.
 
@@ -860,6 +1016,7 @@ class CamadaReativa:
         raio_influencia_laser_m: float = 0.90,
         distancia_saturacao_m: float = 0.32,
         ganho_repulsao: float = 0.35,
+        ganho_tangencial: float = 0.30,
         ganho_simetria: float = 0.30,
         f_rep_max: float = 0.65,
         angulo_frontal_rad: float = math.radians(30.0),
@@ -869,17 +1026,20 @@ class CamadaReativa:
         janela_estagnacao_passos: int = 20,
         limiar_deslocamento_estagnacao_m: float = 0.05,
         limiar_angulo_estagnacao_rad: float = 0.20,
-        passos_recuo: int = 12,
-        passos_giro: int = 10,
+        passos_recuo: int = 22,
+        passos_giro: int = 15,
         velocidade_desejada_m_s: float = 0.50,
         distancia_controle_m: float = 0.20,
         tolerancia_goal_m: float = 0.10,
         raio_robo_m: float = 0.26,
+        distancia_critica_parede_m: float = 0.35,
+        distancia_gap_impassavel_m: float = 0.75,
     ) -> None:
         self.distancia_lookahead_m = float(distancia_lookahead_m)
         self.raio_influencia_laser_m = float(raio_influencia_laser_m)
         self.distancia_saturacao_m = float(distancia_saturacao_m)
         self.ganho_repulsao = float(ganho_repulsao)
+        self.ganho_tangencial = float(ganho_tangencial)
         self.ganho_simetria = float(ganho_simetria)
         self.f_rep_max = float(f_rep_max)
         self.angulo_frontal_rad = float(angulo_frontal_rad)
@@ -897,6 +1057,8 @@ class CamadaReativa:
         self.distancia_controle_m = float(distancia_controle_m)
         self.tolerancia_goal_m = float(tolerancia_goal_m)
         self.raio_robo_m = float(raio_robo_m)
+        self.distancia_critica_parede_m = float(distancia_critica_parede_m)
+        self.distancia_gap_impassavel_m = float(distancia_gap_impassavel_m)
 
         # Estado interno de rastreamento de obstaculos dinamicos
         self._passo_atual = 0
@@ -909,6 +1071,9 @@ class CamadaReativa:
         self._passos_em_recuperacao = 0
         self._historico_poses: list[tuple[int, float, float, float]] = []
 
+        # Telemetria para visualizacao e auditoria de decisoes
+        self.ultima_telemetria: TelemetriaDecisao | None = None
+
     def resetar_recuperacao(self) -> None:
         """Reinicia o monitor de estagnacao e a maquina de recuperacao."""
         self._estado_recuperacao = self.ESTADO_NORMAL
@@ -919,16 +1084,26 @@ class CamadaReativa:
         self, planejador: PlanejadorGlobal | None = None
     ) -> None:
         """Libera todas as celulas dinamicamente bloqueadas e limpa historico."""
-        if planejador is not None and self._celulas_bloqueadas:
-            planejador.marcar_bloqueio(list(self._celulas_bloqueadas), False)
+        if planejador is not None:
+            if hasattr(planejador, "limpar_obstaculos_dinamicos"):
+                planejador.limpar_obstaculos_dinamicos()
+            elif self._celulas_bloqueadas:
+                planejador.marcar_bloqueio(list(self._celulas_bloqueadas), False)
         self._celulas_bloqueadas.clear()
         self._contagens_persistencia.clear()
         self._ultimo_passo_visto.clear()
 
     def selecionar_lookahead(
-        self, pose: tuple[float, float, float], caminho: list[WorldPoint]
+        self,
+        pose: tuple[float, float, float],
+        caminho: list[WorldPoint],
+        planejador: PlanejadorGlobal | None = None,
     ) -> WorldPoint | None:
-        """Seleciona waypoint a frente no caminho global a distancia de lookahead."""
+        """Seleciona waypoint a frente no caminho global a distancia de lookahead.
+
+        Se planejador for fornecido, verifica a linha de visada desobstruida
+        para evitar que a atracao corte quinas de paredes ou obstaculos.
+        """
         if not caminho:
             return None
         if len(caminho) == 1:
@@ -938,11 +1113,22 @@ class CamadaReativa:
             range(len(caminho)),
             key=lambda i: math.hypot(caminho[i][0] - xr, caminho[i][1] - yr),
         )
+        candidato_idx = len(caminho) - 1
         for i in range(idx_mais_proximo, len(caminho)):
             dist = math.hypot(caminho[i][0] - xr, caminho[i][1] - yr)
             if dist >= self.distancia_lookahead_m:
-                return caminho[i]
-        return caminho[-1]
+                candidato_idx = i
+                break
+
+        if planejador is not None:
+            celula_robo = planejador.mundo_para_celula((xr, yr))
+            if celula_robo is not None and not planejador.ocupacao[celula_robo]:
+                for i in range(candidato_idx, idx_mais_proximo, -1):
+                    celula_wp = planejador.mundo_para_celula(caminho[i])
+                    if celula_wp is not None and planejador._linha_livre(celula_robo, celula_wp):
+                        return caminho[i]
+
+        return caminho[candidato_idx]
 
     def calcular_atracao(
         self, pose: tuple[float, float, float], waypoint: WorldPoint
@@ -1024,6 +1210,203 @@ class CamadaReativa:
 
         return fx_total, fy_total
 
+    def filtrar_laser_dinamico(
+        self,
+        pose: tuple[float, float, float],
+        laser: np.ndarray,
+        planejador: PlanejadorGlobal | None = None,
+        incluir_paredes_criticas: bool = False,
+    ) -> np.ndarray:
+        """Filtra leituras do laser mantendo apenas obstaculos dinamicos (e paredes criticas se solicitado).
+
+        Se planejador for None, considera todas as leituras do laser.
+        Se planejador for fornecido, descarta leituras cujas coordenadas mundiais
+        coincidem com obstaculos estaticos (paredes do mapa original infladas),
+        garantindo que o robo acredite no caminho D* para a geometria estatica e
+        aplique campos potenciais exclusivamente contra obstaculos dinamicos.
+        Se incluir_paredes_criticas for True, preserva leituras de paredes que
+        estejam a distancia critica (dist <= distancia_critica_parede_m) para servir
+        de buffer de seguranca contra colisoes de quina.
+        """
+        if laser is None or len(laser) == 0:
+            return np.empty((0, 2), dtype=float)
+        dados = np.asarray(laser, dtype=float)
+        if dados.ndim != 2 or dados.shape[1] < 2:
+            return np.empty((0, 2), dtype=float)
+        if planejador is None:
+            return dados
+
+        angulos = dados[:, 0]
+        distancias = dados[:, 1]
+        xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
+
+        indices_mantidos: list[int] = []
+        for i, (ang, dist) in enumerate(zip(angulos, distancias)):
+            if not (math.isfinite(ang) and math.isfinite(dist) and dist > 0.02):
+                continue
+            xw = xr + dist * math.cos(theta + ang)
+            yw = yr + dist * math.sin(theta + ang)
+            eh_estatico = planejador.eh_obstaculo_estatico((xw, yw))
+            if not eh_estatico:
+                indices_mantidos.append(i)
+            elif incluir_paredes_criticas and dist <= self.distancia_critica_parede_m:
+                indices_mantidos.append(i)
+
+        if not indices_mantidos:
+            return np.empty((0, 2), dtype=float)
+        return dados[indices_mantidos]
+
+    def filtrar_laser_combinado(
+        self,
+        pose: tuple[float, float, float],
+        laser: np.ndarray,
+        planejador: PlanejadorGlobal | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Filtra o laser em uma unica passada, retornando (laser_dinamico, laser_reativo).
+
+        Elimina a duplicacao de calculos trigonometricos e consultas estaticas.
+        """
+        if laser is None or len(laser) == 0:
+            vazio = np.empty((0, 2), dtype=float)
+            return vazio, vazio
+        dados = np.asarray(laser, dtype=float)
+        if dados.ndim != 2 or dados.shape[1] < 2:
+            vazio = np.empty((0, 2), dtype=float)
+            return vazio, vazio
+        if planejador is None:
+            return dados, dados
+
+        angulos = dados[:, 0]
+        distancias = dados[:, 1]
+        xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
+        d_crit = self.distancia_critica_parede_m
+
+        indices_dinamicos: list[int] = []
+        indices_reativos: list[int] = []
+        for i, (ang, dist) in enumerate(zip(angulos, distancias)):
+            if not (math.isfinite(ang) and math.isfinite(dist) and dist > 0.02):
+                continue
+            xw = xr + dist * math.cos(theta + ang)
+            yw = yr + dist * math.sin(theta + ang)
+            eh_estatico = planejador.eh_obstaculo_estatico((xw, yw))
+            if not eh_estatico:
+                indices_dinamicos.append(i)
+                indices_reativos.append(i)
+            elif dist <= d_crit:
+                indices_reativos.append(i)
+
+        laser_din = (
+            dados[indices_dinamicos]
+            if indices_dinamicos
+            else np.empty((0, 2), dtype=float)
+        )
+        laser_reat = (
+            dados[indices_reativos]
+            if indices_reativos
+            else np.empty((0, 2), dtype=float)
+        )
+        return laser_din, laser_reat
+
+    def calcular_repulsao_tangencial(
+        self,
+        pose: tuple[float, float, float],
+        laser: np.ndarray,
+        vetor_atracao: tuple[float, float] | None = None,
+    ) -> tuple[float, float]:
+        """Calcula forca repulsiva tangencial (circulacao) em torno de obstaculos.
+
+        A forca tangencial e perpendicular a forca repulsiva radial e atua para
+        contornar obstaculos rapidamente. A direcao tangencial (horaria ou
+        anti-horaria) e selecionada de modo a maximizar o alinhamento com o
+        vetor de atracao ao goal/lookahead. Em caso de simetria (obstaculo
+        frontal colinear), prioriza o desvio para a direita.
+        """
+        if laser is None or len(laser) == 0:
+            return 0.0, 0.0
+        dados = np.asarray(laser, dtype=float)
+        if dados.ndim != 2 or dados.shape[1] < 2:
+            return 0.0, 0.0
+
+        angulos = dados[:, 0]
+        distancias = dados[:, 1]
+        mask = (
+            np.isfinite(angulos)
+            & np.isfinite(distancias)
+            & (distancias > 0.02)
+            & (distancias < self.raio_influencia_laser_m)
+        )
+        if not np.any(mask):
+            return 0.0, 0.0
+
+        angulos_validos = angulos[mask]
+        dist_validas = distancias[mask]
+
+        num_setores = 24
+        ang_min, ang_max = -math.radians(120.0), math.radians(120.0)
+        largura_setor = (ang_max - ang_min) / num_setores
+
+        setor_indices = np.clip(
+            np.floor((angulos_validos - ang_min) / largura_setor).astype(int),
+            0,
+            num_setores - 1,
+        )
+
+        theta = float(pose[2])
+        fx_tan_total, fy_tan_total = 0.0, 0.0
+
+        v_att_x = 0.0
+        v_att_y = 0.0
+        tem_atracao = False
+        if vetor_atracao is not None and len(vetor_atracao) >= 2:
+            v_att_x, v_att_y = float(vetor_atracao[0]), float(vetor_atracao[1])
+            tem_atracao = math.hypot(v_att_x, v_att_y) > 1e-6
+
+        for s in range(num_setores):
+            em_setor = setor_indices == s
+            if not np.any(em_setor):
+                continue
+            idx_min = np.argmin(dist_validas[em_setor])
+            d_min = float(dist_validas[em_setor][idx_min])
+            ang_obs = float(angulos_validos[em_setor][idx_min])
+
+            d_efetiva = max(d_min, self.distancia_saturacao_m)
+            magnitude = (
+                self.ganho_tangencial
+                * (
+                    (1.0 / d_efetiva)
+                    - (1.0 / self.raio_influencia_laser_m)
+                )
+                * (1.0 / d_efetiva)
+            )
+
+            phi = theta + ang_obs
+            u_tan_dir_x = math.sin(phi)
+            u_tan_dir_y = -math.cos(phi)
+
+            u_tan_esq_x = -math.sin(phi)
+            u_tan_esq_y = math.cos(phi)
+
+            if tem_atracao:
+                dot_dir = v_att_x * u_tan_dir_x + v_att_y * u_tan_dir_y
+                dot_esq = v_att_x * u_tan_esq_x + v_att_y * u_tan_esq_y
+                if dot_esq > dot_dir + 1e-9:
+                    u_escolhido_x, u_escolhido_y = u_tan_esq_x, u_tan_esq_y
+                else:
+                    u_escolhido_x, u_escolhido_y = u_tan_dir_x, u_tan_dir_y
+            else:
+                u_escolhido_x, u_escolhido_y = u_tan_dir_x, u_tan_dir_y
+
+            fx_tan_total += magnitude * u_escolhido_x
+            fy_tan_total += magnitude * u_escolhido_y
+
+        norma = math.hypot(fx_tan_total, fy_tan_total)
+        if norma > self.f_rep_max and norma > 1e-9:
+            escala = self.f_rep_max / norma
+            fx_tan_total *= escala
+            fy_tan_total *= escala
+
+        return fx_tan_total, fy_tan_total
+
     def calcular_quebra_simetria(
         self, pose: tuple[float, float, float], laser: np.ndarray
     ) -> tuple[float, float]:
@@ -1065,7 +1448,7 @@ class CamadaReativa:
         pose: tuple[float, float, float],
         planejador: PlanejadorGlobal,
     ) -> None:
-        """Detecta obstaculos no espaco livre estatico com persistencia e expiracao."""
+        """Detecta obstaculos no espaco livre estatico com persistencia, vedacao de vaos e expiracao."""
         self._passo_atual += 1
 
         celulas_vistas: set[Cell] = set()
@@ -1074,27 +1457,86 @@ class CamadaReativa:
             if dados.ndim == 2 and dados.shape[1] >= 2:
                 angulos = dados[:, 0]
                 distancias = dados[:, 1]
-                mask = (
-                    np.isfinite(angulos)
-                    & np.isfinite(distancias)
-                    & (distancias > self.raio_robo_m)
-                    & (distancias <= self.alcance_dinamico_m)
-                )
-                ang_validos = angulos[mask]
-                dist_validas = distancias[mask]
-
                 xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
-                for ang, dist in zip(ang_validos, dist_validas):
+                n_feixes = len(angulos)
+
+                pontos_mundo: list[tuple[float, float]] = []
+                eh_obstaculo: list[bool] = []
+                eh_dinamico: list[bool] = []
+
+                for ang, dist in zip(angulos, distancias):
+                    if not (math.isfinite(ang) and math.isfinite(dist) and dist > 0.05):
+                        pontos_mundo.append((math.nan, math.nan))
+                        eh_obstaculo.append(False)
+                        eh_dinamico.append(False)
+                        continue
                     xw = xr + dist * math.cos(theta + ang)
                     yw = yr + dist * math.sin(theta + ang)
-                    celula = planejador.mundo_para_celula((xw, yw))
-                    if celula is None:
+                    pontos_mundo.append((xw, yw))
+
+                    no_alcance = dist <= self.alcance_dinamico_m
+                    parede_estatica = (
+                        hasattr(planejador, "eh_obstaculo_estatico")
+                        and planejador.eh_obstaculo_estatico((xw, yw))
+                    )
+                    eh_obs = bool(no_alcance and math.isfinite(xw))
+                    eh_obstaculo.append(eh_obs)
+
+                    eh_din = bool(eh_obs and not parede_estatica)
+                    eh_dinamico.append(eh_din)
+
+                    if eh_din:
+                        celula = planejador.mundo_para_celula((xw, yw))
+                        if (
+                            celula is not None
+                            and celula != planejador.start
+                            and celula != planejador.goal
+                        ):
+                            celulas_vistas.add(celula)
+
+                # Deteccao e vedacao de vaos intransponiveis (Gap Bridging)
+                ultimo_idx_obs: int | None = None
+                for i in range(n_feixes):
+                    if not eh_obstaculo[i]:
                         continue
-                    if planejador.ocupacao_estatica[celula]:
-                        continue
-                    if celula == planejador.start or celula == planejador.goal:
-                        continue
-                    celulas_vistas.add(celula)
+                    if ultimo_idx_obs is not None and (i - ultimo_idx_obs > 1):
+                        if eh_dinamico[ultimo_idx_obs] or eh_dinamico[i]:
+                            d_ant = distancias[ultimo_idx_obs]
+                            d_i = distancias[i]
+                            min_d = min(d_ant, d_i)
+                            tem_abertura = any(
+                                (not math.isfinite(distancias[k]))
+                                or (distancias[k] > min_d + 0.30)
+                                for k in range(ultimo_idx_obs + 1, i)
+                            )
+                            if tem_abertura:
+                                pA = pontos_mundo[ultimo_idx_obs]
+                                pB = pontos_mundo[i]
+                                d_gap = math.hypot(pA[0] - pB[0], pA[1] - pB[1])
+                                if 0.10 < d_gap <= self.distancia_gap_impassavel_m:
+                                    passos_ponte = max(
+                                        2,
+                                        int(
+                                            math.ceil(
+                                                d_gap
+                                                / (planejador.tamanho_celula_m * 0.5)
+                                            )
+                                        ),
+                                    )
+                                    for s in range(1, passos_ponte):
+                                        t = s / passos_ponte
+                                        px = pA[0] + t * (pB[0] - pA[0])
+                                        py = pA[1] + t * (pB[1] - pA[1])
+                                        celula_ponte = planejador.mundo_para_celula(
+                                            (px, py)
+                                        )
+                                        if (
+                                            celula_ponte is not None
+                                            and celula_ponte != planejador.start
+                                            and celula_ponte != planejador.goal
+                                        ):
+                                            celulas_vistas.add(celula_ponte)
+                    ultimo_idx_obs = i
 
         novas_bloqueadas: list[Cell] = []
         for celula in celulas_vistas:
@@ -1180,54 +1622,141 @@ class CamadaReativa:
         caminho: list[WorldPoint],
         laser: np.ndarray,
         goal: WorldPoint,
+        planejador: PlanejadorGlobal | None = None,
     ) -> tuple[float, float] | None:
-        """Combina lookahead, repulsao e quebra de simetria em vetor (vx, vy)."""
+        """Combina lookahead, repulsao radial/tangencial e quebra de simetria em vetor (vx, vy).
+
+        Se planejador for informado, os campos potenciais e ajustes de velocidade
+        atuam exclusivamente sobre obstaculos dinamicos, fazendo com que o robo
+        siga fielmente o caminho D* calculado para os obstaculos estaticos.
+        """
         xr, yr, theta = float(pose[0]), float(pose[1]), float(pose[2])
         dist_goal = math.hypot(goal[0] - xr, goal[1] - yr)
 
         em_recuperacao = self.monitorar_estagnacao(pose, dist_goal)
         if em_recuperacao:
             d_c = self.distancia_controle_m
+            laser_din = self.filtrar_laser_dinamico(pose, laser, planejador)
             if self._estado_recuperacao == self.ESTADO_RECUO:
-                v_rec = -0.20
-                w_rec = -0.30
+                v_rec = -0.25
+                w_rec = -0.20
                 vx = math.cos(theta) * v_rec - d_c * math.sin(theta) * w_rec
                 vy = math.sin(theta) * v_rec + d_c * math.cos(theta) * w_rec
-                return vx, vy
             elif self._estado_recuperacao == self.ESTADO_GIRO:
                 v_giro = 0.0
-                w_giro = -1.0
+                w_giro = -1.20
                 vx = -d_c * math.sin(theta) * w_giro
                 vy = d_c * math.cos(theta) * w_giro
-                return vx, vy
+            else:
+                vx, vy = 0.0, 0.0
 
-        wp = self.selecionar_lookahead(pose, caminho)
+            self.ultima_telemetria = TelemetriaDecisao(
+                pose=pose,
+                caminho=list(caminho),
+                goal=goal,
+                lookahead=None,
+                laser_bruto=(
+                    np.asarray(laser, dtype=float)
+                    if laser is not None and len(laser) > 0
+                    else np.empty((0, 2), dtype=float)
+                ),
+                laser_dinamico=laser_din,
+                v_att=(0.0, 0.0),
+                f_rep=(0.0, 0.0),
+                f_tan=(0.0, 0.0),
+                f_sym=(0.0, 0.0),
+                v_tot=(vx, vy),
+                v_desejado=(vx, vy),
+                estado_recuperacao=self._estado_recuperacao,
+            )
+            return vx, vy
+
+        wp = self.selecionar_lookahead(pose, caminho, planejador=planejador)
+        laser_bruto_arr = (
+            np.asarray(laser, dtype=float)
+            if laser is not None and len(laser) > 0
+            else np.empty((0, 2), dtype=float)
+        )
         if wp is None:
+            laser_din = self.filtrar_laser_dinamico(pose, laser, planejador)
             if not caminho and dist_goal > self.tolerancia_goal_m:
                 self._estado_recuperacao = self.ESTADO_RECUO
                 self._passos_em_recuperacao = 0
                 d_c = self.distancia_controle_m
-                v_rec = -0.20
-                w_rec = -0.30
+                v_rec = -0.25
+                w_rec = -0.20
                 vx = math.cos(theta) * v_rec - d_c * math.sin(theta) * w_rec
                 vy = math.sin(theta) * v_rec + d_c * math.cos(theta) * w_rec
+                self.ultima_telemetria = TelemetriaDecisao(
+                    pose=pose,
+                    caminho=list(caminho),
+                    goal=goal,
+                    lookahead=None,
+                    laser_bruto=laser_bruto_arr,
+                    laser_dinamico=laser_din,
+                    v_att=(0.0, 0.0),
+                    f_rep=(0.0, 0.0),
+                    f_tan=(0.0, 0.0),
+                    f_sym=(0.0, 0.0),
+                    v_tot=(vx, vy),
+                    v_desejado=(vx, vy),
+                    estado_recuperacao=self._estado_recuperacao,
+                )
                 return vx, vy
+            self.ultima_telemetria = TelemetriaDecisao(
+                pose=pose,
+                caminho=list(caminho),
+                goal=goal,
+                lookahead=None,
+                laser_bruto=laser_bruto_arr,
+                laser_dinamico=laser_din,
+                v_att=(0.0, 0.0),
+                f_rep=(0.0, 0.0),
+                f_tan=(0.0, 0.0),
+                f_sym=(0.0, 0.0),
+                v_tot=(0.0, 0.0),
+                v_desejado=None,
+                estado_recuperacao=self._estado_recuperacao,
+            )
             return None
 
-        v_att_x, v_att_y = self.calcular_atracao(pose, wp)
-        f_rep_x, f_rep_y = self.calcular_repulsao(pose, laser)
-        f_sym_x, f_sym_y = self.calcular_quebra_simetria(pose, laser)
+        # Filtra laser em passada unica para obter dinamico e reativo (com buffer critico)
+        laser_dinamico, laser_reativo = self.filtrar_laser_combinado(
+            pose, laser, planejador
+        )
 
-        v_tot_x = v_att_x + f_rep_x + f_sym_x
-        v_tot_y = v_att_y + f_rep_y + f_sym_y
+        v_att_x, v_att_y = self.calcular_atracao(pose, wp)
+        f_rep_x, f_rep_y = self.calcular_repulsao(pose, laser_reativo)
+        f_tan_x, f_tan_y = self.calcular_repulsao_tangencial(
+            pose, laser_dinamico, (v_att_x, v_att_y)
+        )
+        f_sym_x, f_sym_y = self.calcular_quebra_simetria(pose, laser_dinamico)
+
+        v_tot_x = v_att_x + f_rep_x + f_tan_x + f_sym_x
+        v_tot_y = v_att_y + f_rep_y + f_tan_y + f_sym_y
 
         norma = math.hypot(v_tot_x, v_tot_y)
         if norma < 1e-9:
+            self.ultima_telemetria = TelemetriaDecisao(
+                pose=pose,
+                caminho=list(caminho),
+                goal=goal,
+                lookahead=wp,
+                laser_bruto=laser_bruto_arr,
+                laser_dinamico=laser_dinamico,
+                v_att=(v_att_x, v_att_y),
+                f_rep=(f_rep_x, f_rep_y),
+                f_tan=(f_tan_x, f_tan_y),
+                f_sym=(f_sym_x, f_sym_y),
+                v_tot=(v_tot_x, v_tot_y),
+                v_desejado=None,
+                estado_recuperacao=self._estado_recuperacao,
+            )
             return None
 
         v_alvo = self.velocidade_desejada_m_s
-        if laser is not None and len(laser) > 0:
-            dados = np.asarray(laser, dtype=float)
+        if laser_reativo is not None and len(laser_reativo) > 0:
+            dados = np.asarray(laser_reativo, dtype=float)
             if dados.ndim == 2 and dados.shape[1] >= 2:
                 ang = dados[:, 0]
                 dst = dados[:, 1]
@@ -1236,13 +1765,549 @@ class CamadaReativa:
                 ) & (dst > 0.02) & np.isfinite(dst)
                 if np.any(mask_f):
                     d_min_f = float(np.min(dst[mask_f]))
-                    if d_min_f < 0.50:
+                    if d_min_f < 0.65:
                         v_alvo = max(
-                            0.18, self.velocidade_desejada_m_s * (d_min_f / 0.50)
+                            0.12, self.velocidade_desejada_m_s * (d_min_f / 0.65)
                         )
 
         escala = v_alvo / norma
-        return v_tot_x * escala, v_tot_y * escala
+        v_des_x = v_tot_x * escala
+        v_des_y = v_tot_y * escala
+
+        self.ultima_telemetria = TelemetriaDecisao(
+            pose=pose,
+            caminho=list(caminho),
+            goal=goal,
+            lookahead=wp,
+            laser_bruto=laser_bruto_arr,
+            laser_dinamico=laser_dinamico,
+            v_att=(v_att_x, v_att_y),
+            f_rep=(f_rep_x, f_rep_y),
+            f_tan=(f_tan_x, f_tan_y),
+            f_sym=(f_sym_x, f_sym_y),
+            v_tot=(v_tot_x, v_tot_y),
+            v_desejado=(v_des_x, v_des_y),
+            estado_recuperacao=self._estado_recuperacao,
+        )
+        return v_des_x, v_des_y
+
+
+
+class VisualizadorNavegacao:
+    """Janela grafica interativa para visualizacao em tempo real do planejamento e telemetria."""
+
+    def __init__(
+        self,
+        titulo: str = "Pioneer P3-DX - Visão e Decisões de Navegação em Tempo Real",
+        tamanho_figura: tuple[float, float] = (14.0, 7.0),
+        intervalo_passos: int = 1,
+    ) -> None:
+        import matplotlib
+
+        try:
+            if matplotlib.get_backend().lower() == "agg":
+                matplotlib.use("TkAgg")
+        except Exception:
+            pass
+
+        import matplotlib.gridspec as gridspec
+        import matplotlib.patches as patches
+        import matplotlib.pyplot as plt
+
+        self.plt = plt
+        self.patches = patches
+        self.titulo = titulo
+        self.intervalo_passos = max(1, int(intervalo_passos))
+        self._contador_passos = 0
+
+        self.plt.ion()
+        self.fig = self.plt.figure(figsize=tamanho_figura)
+        try:
+            self.fig.canvas.manager.set_window_title(self.titulo)
+        except Exception:
+            pass
+
+        gs = gridspec.GridSpec(
+            2, 2, width_ratios=[1.25, 1.0], height_ratios=[1.3, 0.7]
+        )
+        self.ax_global = self.fig.add_subplot(gs[:, 0])
+        self.ax_local = self.fig.add_subplot(gs[0, 1])
+        self.ax_hud = self.fig.add_subplot(gs[1, 1])
+        self.ax_hud.axis("off")
+
+        self._im_global = None
+        (self._linha_rota_global,) = self.ax_global.plot(
+            [], [], "--", color="#ea580c", lw=1.8, alpha=0.9, label="Rota D* Lite"
+        )
+        (self._linha_trajetoria_global,) = self.ax_global.plot(
+            [],
+            [],
+            "-",
+            color="#2563eb",
+            lw=2.2,
+            alpha=0.85,
+            label="Trajetória percorrida",
+        )
+        self._scatter_goals_pendentes = self.ax_global.scatter(
+            [],
+            [],
+            s=110,
+            marker="*",
+            color="#ef4444",
+            edgecolors="white",
+            lw=0.8,
+            zorder=6,
+            label="Goals pendentes",
+        )
+        self._scatter_goals_alcancados = self.ax_global.scatter(
+            [],
+            [],
+            s=120,
+            marker="*",
+            color="#16a34a",
+            edgecolors="white",
+            lw=0.8,
+            zorder=6,
+            label="Goals alcançados",
+        )
+        self._scatter_robo_global = self.ax_global.scatter(
+            [],
+            [],
+            s=80,
+            marker="o",
+            color="#7c3aed",
+            edgecolors="white",
+            lw=1.0,
+            zorder=7,
+            label="Robô",
+        )
+        self._anotacoes_goals: list[object] = []
+
+        self._im_local = None
+        self._patch_casco = self.patches.Circle(
+            (0, 0),
+            radius=0.26,
+            facecolor="#93c5fd",
+            edgecolor="#1d4ed8",
+            lw=1.5,
+            alpha=0.65,
+            zorder=4,
+        )
+        self._patch_margem = self.patches.Circle(
+            (0, 0),
+            radius=0.41,
+            facecolor="none",
+            edgecolor="#64748b",
+            lw=1.2,
+            linestyle="--",
+            alpha=0.7,
+            zorder=3,
+        )
+        self.ax_local.add_patch(self._patch_casco)
+        self.ax_local.add_patch(self._patch_margem)
+
+        (self._linha_rota_local,) = self.ax_local.plot(
+            [], [], "--", color="#ea580c", lw=2.0, alpha=0.9, zorder=3
+        )
+        self._scatter_laser_estatico = self.ax_local.scatter(
+            [], [], s=10, color="#94a3b8", alpha=0.5, zorder=2
+        )
+        self._scatter_laser_dinamico = self.ax_local.scatter(
+            [], [], s=28, color="#ef4444", edgecolors="#fef08a", lw=0.6, zorder=5
+        )
+        self._scatter_lookahead = self.ax_local.scatter(
+            [],
+            [],
+            s=90,
+            marker="X",
+            color="#06b6d4",
+            edgecolors="black",
+            lw=0.8,
+            zorder=6,
+        )
+
+        self._q_att = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#16a34a",
+            width=0.012,
+            zorder=7,
+        )
+        self._q_rep = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#dc2626",
+            width=0.012,
+            zorder=7,
+        )
+        self._q_tan = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#c026d3",
+            width=0.012,
+            zorder=7,
+        )
+        self._q_sym = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#d97706",
+            width=0.010,
+            zorder=7,
+        )
+        self._q_tot = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#1e3a8a",
+            width=0.016,
+            zorder=8,
+        )
+        self._q_orientacao = self.ax_local.quiver(
+            [0],
+            [0],
+            [0],
+            [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="#1e293b",
+            width=0.010,
+            zorder=5,
+        )
+
+        self.ax_local.plot([], [], color="#16a34a", lw=2.0, label="v_att (Atração D*)")
+        self.ax_local.plot(
+            [], [], color="#dc2626", lw=2.0, label="F_rep (Repulsão Radial)"
+        )
+        self.ax_local.plot(
+            [], [], color="#c026d3", lw=2.0, label="F_tan (Repulsão Tangencial)"
+        )
+        self.ax_local.plot(
+            [], [], color="#d97706", lw=1.5, label="F_sym (Quebra Simetria)"
+        )
+        self.ax_local.plot(
+            [], [], color="#1e3a8a", lw=2.5, label="v_des (Comando Resultante)"
+        )
+        self.ax_local.scatter(
+            [], [], s=20, color="#ef4444", label="Laser Dinâmico"
+        )
+        self.ax_local.scatter(
+            [], [], s=12, color="#94a3b8", label="Laser Parede Estática"
+        )
+        self.ax_local.legend(
+            loc="upper right", fontsize=7.5, framealpha=0.9, facecolor="#ffffff"
+        )
+
+        self._hud_text = self.ax_hud.text(
+            0.02,
+            0.95,
+            "Inicializando telemetria...",
+            transform=self.ax_hud.transAxes,
+            fontsize=8.0,
+            fontfamily="monospace",
+            verticalalignment="top",
+            bbox=dict(
+                boxstyle="round,pad=0.5",
+                facecolor="#0f172a",
+                edgecolor="#334155",
+            ),
+            color="#f8fafc",
+        )
+
+        self.ax_global.set_title(
+            "Visão Global do Robô — Mapa D* Lite & Trajetória",
+            fontsize=10,
+            weight="bold",
+        )
+        self.ax_global.set_xlabel("x (m)", fontsize=9)
+        self.ax_global.set_ylabel("y (m)", fontsize=9)
+        self.ax_global.grid(True, alpha=0.25)
+        self.ax_global.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+        self.ax_local.set_title(
+            "Visão Local do Robô — Decisões & Forças Reativas",
+            fontsize=10,
+            weight="bold",
+        )
+        self.ax_local.set_xlabel("x (m)", fontsize=9)
+        self.ax_local.set_ylabel("y (m)", fontsize=9)
+        self.ax_local.grid(True, alpha=0.3)
+        self.ax_local.set_aspect("equal", adjustable="box")
+
+        self.plt.tight_layout()
+        self.plt.show(block=False)
+        self.fig.canvas.flush_events()
+
+    def atualizar(
+        self,
+        *,
+        telemetria: TelemetriaDecisao | None,
+        planejador: PlanejadorGlobal | None,
+        goals: list[tuple[float, float]],
+        indice_goal: int,
+        trajetoria: list[tuple[float, float, float]] | None = None,
+    ) -> None:
+        """Atualiza os graficos em tempo real com estado e telemetria atuais."""
+        self._contador_passos += 1
+        if self._contador_passos % self.intervalo_passos != 0:
+            return
+        if not self.plt.fignum_exists(self.fig.number):
+            return
+        if telemetria is None or planejador is None:
+            return
+
+        try:
+            xr, yr, theta = telemetria.pose
+            extent = (
+                planejador.origem[0],
+                planejador.origem[0] + planejador.largura_m,
+                planejador.origem[1],
+                planejador.origem[1] + planejador.altura_m,
+            )
+
+            rows, cols = planejador.rows, planejador.cols
+            rgb_mapa = np.full((rows, cols, 3), 245, dtype=np.uint8)
+            rgb_mapa[planejador.ocupacao_estatica] = [200, 205, 210]
+            if hasattr(planejador, "ocupacao_base"):
+                rgb_mapa[planejador.ocupacao_base] = [35, 40, 50]
+            if hasattr(planejador, "ocupacao_dinamica"):
+                rgb_mapa[planejador.ocupacao_dinamica] = [220, 38, 38]
+
+            img_rgb_flip = np.flipud(rgb_mapa)
+
+            if self._im_global is None:
+                self._im_global = self.ax_global.imshow(
+                    img_rgb_flip, extent=extent, origin="lower", zorder=1
+                )
+                self._im_local = self.ax_local.imshow(
+                    img_rgb_flip, extent=extent, origin="lower", zorder=1
+                )
+                self.ax_global.set_xlim(extent[0], extent[1])
+                self.ax_global.set_ylim(extent[2], extent[3])
+                self.ax_global.set_aspect("equal", adjustable="box")
+            else:
+                self._im_global.set_data(img_rgb_flip)
+                self._im_local.set_data(img_rgb_flip)
+
+            if telemetria.caminho and len(telemetria.caminho) > 1:
+                pts_caminho = np.asarray(telemetria.caminho)
+                self._linha_rota_global.set_data(
+                    pts_caminho[:, 0], pts_caminho[:, 1]
+                )
+                self._linha_rota_local.set_data(
+                    pts_caminho[:, 0], pts_caminho[:, 1]
+                )
+            else:
+                self._linha_rota_global.set_data([], [])
+                self._linha_rota_local.set_data([], [])
+
+            if trajetoria and len(trajetoria) > 1:
+                pts = (
+                    trajetoria[:: max(1, len(trajetoria) // 1000)]
+                    if len(trajetoria) > 1000
+                    else trajetoria
+                )
+                pts_traj = np.asarray([(x, y) for x, y, _ in pts])
+                self._linha_trajetoria_global.set_data(
+                    pts_traj[:, 0], pts_traj[:, 1]
+                )
+
+            pts_alcancados = goals[:indice_goal]
+            pts_pendentes = goals[indice_goal:]
+            if pts_alcancados:
+                self._scatter_goals_alcancados.set_offsets(
+                    np.asarray(pts_alcancados)
+                )
+            else:
+                self._scatter_goals_alcancados.set_offsets(np.empty((0, 2)))
+
+            if pts_pendentes:
+                self._scatter_goals_pendentes.set_offsets(
+                    np.asarray(pts_pendentes)
+                )
+            else:
+                self._scatter_goals_pendentes.set_offsets(np.empty((0, 2)))
+
+            if len(self._anotacoes_goals) != len(goals):
+                for a in self._anotacoes_goals:
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+                self._anotacoes_goals.clear()
+                for idx, (gx, gy) in enumerate(goals, start=1):
+                    anotacao = self.ax_global.annotate(
+                        f"G{idx}",
+                        (gx, gy),
+                        xytext=(5, 5),
+                        textcoords="offset points",
+                        color="#0f172a",
+                        weight="bold",
+                        fontsize=8.5,
+                    )
+                    self._anotacoes_goals.append(anotacao)
+
+            self._scatter_robo_global.set_offsets([[xr, yr]])
+
+            zoom = 2.5
+            self.ax_local.set_xlim(xr - zoom, xr + zoom)
+            self.ax_local.set_ylim(yr - zoom, yr + zoom)
+            self._patch_casco.set_center((xr, yr))
+            self._patch_margem.set_center((xr, yr))
+
+            tam_orient = 0.35
+            self._q_orientacao.set_offsets([[xr, yr]])
+            self._q_orientacao.set_UVC(
+                [tam_orient * math.cos(theta)], [tam_orient * math.sin(theta)]
+            )
+
+            pontos_estaticos: list[tuple[float, float]] = []
+            pontos_dinamicos: list[tuple[float, float]] = []
+            if len(telemetria.laser_bruto) > 0:
+                for ang, dist in telemetria.laser_bruto:
+                    if not (
+                        math.isfinite(ang)
+                        and math.isfinite(dist)
+                        and 0.02 < dist < 4.5
+                    ):
+                        continue
+                    xw = xr + dist * math.cos(theta + ang)
+                    yw = yr + dist * math.sin(theta + ang)
+                    if (
+                        abs(xw - xr) <= zoom + 0.5
+                        and abs(yw - yr) <= zoom + 0.5
+                    ):
+                        if (
+                            hasattr(planejador, "eh_obstaculo_estatico")
+                            and planejador.eh_obstaculo_estatico((xw, yw))
+                        ):
+                            pontos_estaticos.append((xw, yw))
+                        else:
+                            pontos_dinamicos.append((xw, yw))
+
+            if pontos_estaticos:
+                self._scatter_laser_estatico.set_offsets(
+                    np.asarray(pontos_estaticos)
+                )
+            else:
+                self._scatter_laser_estatico.set_offsets(np.empty((0, 2)))
+
+            if pontos_dinamicos:
+                self._scatter_laser_dinamico.set_offsets(
+                    np.asarray(pontos_dinamicos)
+                )
+            else:
+                self._scatter_laser_dinamico.set_offsets(np.empty((0, 2)))
+
+            if telemetria.lookahead is not None:
+                self._scatter_lookahead.set_offsets(
+                    [[telemetria.lookahead[0], telemetria.lookahead[1]]]
+                )
+            else:
+                self._scatter_lookahead.set_offsets(np.empty((0, 2)))
+
+            self._q_att.set_offsets([[xr, yr]])
+            self._q_att.set_UVC([telemetria.v_att[0]], [telemetria.v_att[1]])
+
+            self._q_rep.set_offsets([[xr, yr]])
+            self._q_rep.set_UVC([telemetria.f_rep[0]], [telemetria.f_rep[1]])
+
+            self._q_tan.set_offsets([[xr, yr]])
+            self._q_tan.set_UVC([telemetria.f_tan[0]], [telemetria.f_tan[1]])
+
+            self._q_sym.set_offsets([[xr, yr]])
+            self._q_sym.set_UVC([telemetria.f_sym[0]], [telemetria.f_sym[1]])
+
+            v_des_x, v_des_y = (
+                telemetria.v_desejado
+                if telemetria.v_desejado is not None
+                else (0.0, 0.0)
+            )
+            self._q_tot.set_offsets([[xr, yr]])
+            self._q_tot.set_UVC([v_des_x], [v_des_y])
+
+            nomes_estados = {
+                0: "NORMAL (Seguindo D* + APF Dinâmico)",
+                1: "⚠️ RECUO ATIVO (Recuperação de Estagnação)",
+                2: "⚠️ GIRO ATIVO (Alinhamento de Rota)",
+            }
+            nome_estado = nomes_estados.get(
+                telemetria.estado_recuperacao, "DESCONHECIDO"
+            )
+            dist_meta = math.hypot(
+                telemetria.goal[0] - xr, telemetria.goal[1] - yr
+            )
+
+            norm_att = math.hypot(*telemetria.v_att)
+            norm_rep = math.hypot(*telemetria.f_rep)
+            norm_tan = math.hypot(*telemetria.f_tan)
+            norm_sym = math.hypot(*telemetria.f_sym)
+            norm_tot = math.hypot(v_des_x, v_des_y)
+
+            num_din_laser = len(pontos_dinamicos)
+            num_bloq_grid = (
+                int(np.count_nonzero(planejador.ocupacao_dinamica))
+                if hasattr(planejador, "ocupacao_dinamica")
+                else 0
+            )
+            num_wp = len(telemetria.caminho)
+
+            texto = (
+                f"╔═══════════════════ PAINEL DE DECISÕES & TELEMETRIA ═══════════════════╗\n"
+                f"║ Estado:         {nome_estado:<48} ║\n"
+                f"║ Meta Ativa:     G{indice_goal + 1}/{len(goals)} em ({telemetria.goal[0]:.2f}, {telemetria.goal[1]:.2f}) m | Distância: {dist_meta:.2f} m{'':<10} ║\n"
+                f"║ Velocidades:    v = {telemetria.v_linear:+.2f} m/s | w = {telemetria.w_angular:+.2f} rad/s (wl={telemetria.wl:+.1f}, wr={telemetria.wr:+.1f}){'':<4} ║\n"
+                f"╠─────────────────── FORÇAS DA CAMADA REATIVA ──────────────────────────╣\n"
+                f"║ • Atração D* (v_att):        {norm_att:.2f} m/s [verde]{'':<26} ║\n"
+                f"║ • Repulsão Radial (F_rep):   {norm_rep:.2f} m/s [vermelho - obst. dinâmicos]{'':<10} ║\n"
+                f"║ • Repulsão Tangencial (F_tan):{norm_tan:.2f} m/s [magenta - circulação rápida]{'':<8} ║\n"
+                f"║ • Quebra Simetria (F_sym):   {norm_sym:.2f} m/s [ouro - desvio à direita]{'':<13} ║\n"
+                f"║ • Vetor Resultante (v_des):  {norm_tot:.2f} m/s [azul escuro]{'':<23} ║\n"
+                f"╠─────────────────── ESTADO DO MAPA & SENSORES ─────────────────────────╣\n"
+                f"║ • Feixes Laser Dinâmicos:    {num_din_laser} pontos detectados no campo local{'':<13} ║\n"
+                f"║ • Células Bloqueadas D*:     {num_bloq_grid} células dinâmicas ativas no grid{'':<12} ║\n"
+                f"║ • Caminho D* Lite:           {num_wp} waypoints até o destino{'':<21} ║\n"
+                f"╚════════════════════════════════════════════════════════════════════════╝"
+            )
+            self._hud_text.set_text(texto)
+
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+            self.plt.pause(0.001)
+        except Exception:
+            pass
+
+    def fechar(self) -> None:
+        """Fecha a janela do visualizador com seguranca."""
+        try:
+            if self.plt.fignum_exists(self.fig.number):
+                self.plt.close(self.fig)
+        except Exception:
+            pass
 
 
 __all__ = [
@@ -1254,6 +2319,8 @@ __all__ = [
     "HokuyoSensorSim",
     "PlanejadorGlobal",
     "Sensoriamento",
+    "TelemetriaDecisao",
+    "VisualizadorNavegacao",
     "WorldPoint",
 ]
 
@@ -1277,12 +2344,16 @@ class Agent:
     VELOCIDADE_DESEJADA_M_S = 0.50
     LOOKAHEAD_M = 0.60
 
-    def __init__(self, id_robo):
+    def __init__(self, id_robo: int, *, visualizar: bool = False):
         """Inicializa o agente sem alterar a assinatura exigida pelo TP2.
 
         Args:
             id_robo: Identificador um-baseado recebido pelo servidor. O objeto
                 CoppeliaSim correspondente e ``PioneerP3DX[id_robo - 1]``.
+            visualizar: Se ``True``, abre janela em tempo real exibindo mapa D*,
+                visão ego local, vetores de força reativa e telemetria. Pode
+                também ser habilitado via variável de ambiente ``TP2_VISUALIZAR=1``
+                ou pelo método ``agente.habilitar_visualizacao()``.
         """
         self.id = id_robo
         self.robotname = f"PioneerP3DX[{self.id - 1}]"
@@ -1303,6 +2374,46 @@ class Agent:
         self._assinatura_goals: tuple[tuple[float, float], ...] | None = None
         self._indice_goal = 0
         self._goal_planejado: tuple[float, float] | None = None
+        self._historico_trajetoria: list[tuple[float, float, float]] = []
+
+        visualizar_env = os.environ.get("TP2_VISUALIZAR", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._visualizacao_ativa = bool(visualizar or visualizar_env)
+        self._visualizador: VisualizadorNavegacao | None = None
+        if self._visualizacao_ativa:
+            self.habilitar_visualizacao(True)
+
+    def habilitar_visualizacao(
+        self,
+        ativo: bool = True,
+        *,
+        titulo: str | None = None,
+        intervalo_passos: int = 1,
+    ) -> None:
+        """Habilita ou desabilita a janela de visualizacao grafica em tempo real."""
+        self._visualizacao_ativa = bool(ativo)
+        if self._visualizacao_ativa:
+            if self._visualizador is None:
+                nome_janela = (
+                    titulo
+                    or f"Pioneer P3-DX #{self.id} — Navegação & Decisões em Tempo Real"
+                )
+                self._visualizador = VisualizadorNavegacao(
+                    titulo=nome_janela, intervalo_passos=intervalo_passos
+                )
+        else:
+            self.fechar_visualizacao()
+
+    def fechar_visualizacao(self) -> None:
+        """Fecha a janela grafica do visualizador se estiver aberta."""
+        if self._visualizador is not None:
+            self._visualizador.fechar()
+            self._visualizador = None
+        self._visualizacao_ativa = False
 
     def movement(self, sim, img, goal_list):
         """Executa um ciclo e informa se o goal corrente foi alcancado."""
@@ -1324,6 +2435,8 @@ class Agent:
             self._goal_planejado = goal_atual
 
         pose = self._sensoriamento.obter_pose(sim, self.robotname)
+        self._historico_trajetoria.append(pose)
+
         if self._detector_chegada.chegou(
             pose, goal_atual, tol=self.TOLERANCIA_GOAL_M
         ):
@@ -1335,6 +2448,14 @@ class Agent:
                 proximo_goal = goals[self._indice_goal]
                 self._planejador.definir_goal(proximo_goal)
                 self._goal_planejado = proximo_goal
+            if self._visualizacao_ativa and self._visualizador is not None:
+                self._visualizador.atualizar(
+                    telemetria=self._camada_reativa.ultima_telemetria,
+                    planejador=self._planejador,
+                    goals=list(goals),
+                    indice_goal=self._indice_goal,
+                    trajetoria=self._historico_trajetoria,
+                )
             return True
 
         laser = self._sensoriamento.obter_laser(sim, self.robotname)
@@ -1346,15 +2467,39 @@ class Agent:
         caminho = self._planejador.caminho_completo(pose)
 
         vetor = self._camada_reativa.calcular_vetor_desejado(
-            pose, caminho, laser, goal_atual
+            pose, caminho, laser, goal_atual, planejador=self._planejador
         )
         if vetor is None:
             self._parar_rodas(sim)
+            if self._visualizacao_ativa and self._visualizador is not None:
+                self._visualizador.atualizar(
+                    telemetria=self._camada_reativa.ultima_telemetria,
+                    planejador=self._planejador,
+                    goals=list(goals),
+                    indice_goal=self._indice_goal,
+                    trajetoria=self._historico_trajetoria,
+                )
             return False
 
         v, w = self._controlador.controlar(pose, vetor)
         wl, wr = self._controlador.para_velocidades_roda(v, w, self.L, self.r)
         self._enviar_velocidades_roda(sim, wl, wr)
+
+        if self._camada_reativa.ultima_telemetria is not None:
+            self._camada_reativa.ultima_telemetria.v_linear = float(v)
+            self._camada_reativa.ultima_telemetria.w_angular = float(w)
+            self._camada_reativa.ultima_telemetria.wl = float(wl)
+            self._camada_reativa.ultima_telemetria.wr = float(wr)
+
+        if self._visualizacao_ativa and self._visualizador is not None:
+            self._visualizador.atualizar(
+                telemetria=self._camada_reativa.ultima_telemetria,
+                planejador=self._planejador,
+                goals=list(goals),
+                indice_goal=self._indice_goal,
+                trajetoria=self._historico_trajetoria,
+            )
+
         return False
 
     def _inicializar_planejador(self, img: np.ndarray) -> None:
