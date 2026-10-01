@@ -1,5 +1,9 @@
 # Camada Reativa Dinâmica — Documentação Técnica (Pessoa B)
 
+> Nota: este texto registra uma etapa anterior da camada reativa. As assinaturas
+> públicas, parâmetros e resultados finais estão atualizados em
+> [docs/RELATORIO.md](docs/RELATORIO.md).
+
 **Data:** 30/09/2026  
 **Escopo:** Implementação, modelagem matemática, calibração e validação da camada reativa dinâmica do Pioneer P3-DX no Trabalho Prático 2 de Robótica Móvel (UFMG).  
 **Arquivo principal:** [`src/Agente1.py`](src/Agente1.py)  

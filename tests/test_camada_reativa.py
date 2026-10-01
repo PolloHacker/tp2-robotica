@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -401,6 +402,13 @@ class TestCombinacaoVetorDesejado(unittest.TestCase):
 
 
 class TestIntegracaoAgent(unittest.TestCase):
+    def test_assinaturas_exigidas_pelo_template(self) -> None:
+        self.assertEqual(list(inspect.signature(Agent.__init__).parameters), ["self", "id_robo"])
+        self.assertEqual(
+            list(inspect.signature(Agent.movement).parameters),
+            ["self", "sim", "img", "goal_list"],
+        )
+
     """Testes de integracao com a classe Agent e o ciclo movement."""
 
     def test_inicializacao_agente(self) -> None:
@@ -692,7 +700,7 @@ class TestTelemetriaEVisualizador(unittest.TestCase):
 
     def test_agent_habilitar_e_fechar_visualizacao(self) -> None:
         """Agent deve permitir habilitar e fechar a visualizacao dinamicamente."""
-        agente = Agent(1, visualizar=False)
+        agente = Agent(1)
         self.assertFalse(agente._visualizacao_ativa)
         self.assertIsNone(agente._visualizador)
 
@@ -706,7 +714,7 @@ class TestTelemetriaEVisualizador(unittest.TestCase):
 
     def test_agent_movement_atualiza_trajetoria_e_telemetria(self) -> None:
         """movement deve alimentar o historico de trajetoria e telemetria de controle."""
-        agente = Agent(1, visualizar=False)
+        agente = Agent(1)
         sim_mock = MagicMock()
         sim_mock.getObject.return_value = 1
         sim_mock.getStringProperty.return_value = "PioneerP3DX"
@@ -771,6 +779,22 @@ class TestInflacaoEContagemReferencia(unittest.TestCase):
         np.testing.assert_array_equal(
             self.planejador.ocupacao, self.planejador.ocupacao_estatica
         )
+
+    def test_desbloqueio_preserva_pegada_de_outra_observacao(self) -> None:
+        """Mudanca do start nao pode liberar celula pertencente a outro obstaculo."""
+        centro_a, centro_b = (25, 25), (25, 26)
+        celula_comum = (25, 25)
+        self.planejador.start = celula_comum
+        self.planejador.marcar_bloqueio([centro_a], True)
+        self.assertFalse(self.planejador.ocupacao_dinamica[celula_comum])
+
+        self.planejador.start = (10, 10)
+        self.planejador.marcar_bloqueio([centro_b], True)
+        self.assertTrue(self.planejador.ocupacao_dinamica[celula_comum])
+        self.planejador.marcar_bloqueio([centro_a], False)
+        self.assertTrue(self.planejador.ocupacao_dinamica[celula_comum])
+        self.planejador.marcar_bloqueio([centro_b], False)
+        self.assertFalse(self.planejador.ocupacao_dinamica[celula_comum])
 
     def test_liberacao_completa_apos_expiracao(self) -> None:
         """Camada reativa garante liberacao de todas as celulas infladas apos expiracao."""

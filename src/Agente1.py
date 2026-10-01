@@ -79,6 +79,9 @@ class PlanejadorGlobal:
         self._contagem_bloqueio_dinamico = np.zeros_like(
             self.ocupacao_estatica, dtype=np.int32
         )
+        # Guarda as celulas efetivamente adicionadas por cada observacao. A
+        # protecao do start/goal pode mudar entre bloqueio e desbloqueio.
+        self._pegadas_bloqueio: dict[tuple[Cell, bool], list[set[Cell]]] = {}
         if raio_inflacao_dinamica_m is not None:
             self.raio_inflacao_dinamica_m = float(raio_inflacao_dinamica_m)
         else:
@@ -339,42 +342,46 @@ class PlanejadorGlobal:
             raise ValueError("bloqueado deve ser booleano")
 
         deltas = self._deltas_inflacao_dinamica if inflar else [(0, 0)]
-        celulas_afetadas: set[Cell] = set()
-
         for celula_centro in celulas:
             if not self._celula_valida(celula_centro):
                 continue
             cr, cc = celula_centro
+            celulas_afetadas: set[Cell] = set()
             for dr, dc in deltas:
                 r, c = cr + dr, cc + dc
                 if 0 <= r < self.rows and 0 <= c < self.cols:
                     celulas_afetadas.add((r, c))
-
-        for linha, coluna in celulas_afetadas:
-            # Uma parede estatica ja esta permanentemente ocupada.
-            if self.ocupacao_estatica[linha, coluna]:
-                continue
-
             if bloqueado:
-                # Nao bloqueia a celula onde o robo ou o goal estao agora
-                if (linha, coluna) == self.start or (linha, coluna) == self.goal:
-                    continue
-                if self._contagem_bloqueio_dinamico[linha, coluna] == 0:
-                    self.ocupacao_dinamica[linha, coluna] = True
-                    self.ocupacao[linha, coluna] = True
-                    self._celulas_dinamicas_pendentes.add((linha, coluna))
-                    self._replanejamento_pendente = True
-                self._contagem_bloqueio_dinamico[linha, coluna] += 1
+                pegada = {
+                    celula for celula in celulas_afetadas
+                    if not self.ocupacao_estatica[celula]
+                    and celula != self.start and celula != self.goal
+                }
+                self._pegadas_bloqueio.setdefault((celula_centro, inflar), []).append(pegada)
             else:
-                if self._contagem_bloqueio_dinamico[linha, coluna] > 0:
-                    self._contagem_bloqueio_dinamico[linha, coluna] -= 1
+                registros = self._pegadas_bloqueio.get((celula_centro, inflar))
+                if not registros:
+                    continue
+                pegada = registros.pop()
+                if not registros:
+                    del self._pegadas_bloqueio[(celula_centro, inflar)]
+
+            for linha, coluna in pegada:
+                if bloqueado:
                     if self._contagem_bloqueio_dinamico[linha, coluna] == 0:
-                        self.ocupacao_dinamica[linha, coluna] = False
-                        self.ocupacao[linha, coluna] = bool(
-                            self.ocupacao_estatica[linha, coluna]
-                        )
+                        self.ocupacao_dinamica[linha, coluna] = True
+                        self.ocupacao[linha, coluna] = True
                         self._celulas_dinamicas_pendentes.add((linha, coluna))
                         self._replanejamento_pendente = True
+                    self._contagem_bloqueio_dinamico[linha, coluna] += 1
+                else:
+                    if self._contagem_bloqueio_dinamico[linha, coluna] > 0:
+                        self._contagem_bloqueio_dinamico[linha, coluna] -= 1
+                        if self._contagem_bloqueio_dinamico[linha, coluna] == 0:
+                            self.ocupacao_dinamica[linha, coluna] = False
+                            self.ocupacao[linha, coluna] = False
+                            self._celulas_dinamicas_pendentes.add((linha, coluna))
+                            self._replanejamento_pendente = True
 
     def limpar_obstaculos_dinamicos(self) -> None:
         """Remove todos os obstaculos dinamicos e restaura ocupacao estatica."""
@@ -384,6 +391,7 @@ class PlanejadorGlobal:
             self.ocupacao[r, c] = bool(self.ocupacao_estatica[r, c])
             self._celulas_dinamicas_pendentes.add((int(r), int(c)))
         self._contagem_bloqueio_dinamico.fill(0)
+        self._pegadas_bloqueio.clear()
         if len(linhas) > 0:
             self._replanejamento_pendente = True
 
@@ -571,15 +579,12 @@ class PlanejadorGlobal:
     def _vizinhos(self, celula: Cell) -> list[Cell]:
         """Lista todos os vizinhos 8-conexos internos, inclusive ocupados."""
         linha, coluna = celula
-        vizinhos: list[Cell] = []
-        for delta_linha in (-1, 0, 1):
-            for delta_coluna in (-1, 0, 1):
-                if delta_linha == 0 and delta_coluna == 0:
-                    continue
-                candidato = linha + delta_linha, coluna + delta_coluna
-                if self._celula_valida(candidato):
-                    vizinhos.append(candidato)
-        return vizinhos
+        return [
+            (r, c)
+            for r in range(max(0, linha - 1), min(self.rows, linha + 2))
+            for c in range(max(0, coluna - 1), min(self.cols, coluna + 2))
+            if r != linha or c != coluna
+        ]
 
     def _custo(self, origem: Cell, destino: Cell) -> float:
         """Retorna custo de aresta ou infinito se o movimento for inviavel."""
@@ -763,6 +768,22 @@ class HokuyoSensorSim:
         if any(objeto == -1 for objeto in self._vision_sensors_obj):
             raise ValueError(f"vision sensor ausente abaixo de {base_name}")
 
+        self._transformacoes_relativas: list[np.ndarray | None] = []
+        for vision_sensor in self._vision_sensors_obj:
+            try:
+                matriz_sensor = self._sim.getObjectMatrix(vision_sensor)
+                matriz_base_inversa = self._sim.getMatrixInverse(
+                    self._sim.getObjectMatrix(self._base_obj)
+                )
+                t_rel = self._sim.multiplyMatrices(
+                    matriz_base_inversa, matriz_sensor
+                )
+                self._transformacoes_relativas.append(
+                    np.asarray(t_rel, dtype=float).reshape(3, 4)
+                )
+            except Exception:
+                self._transformacoes_relativas.append(None)
+
     def get_is_range_data(self) -> bool:
         """Informa se ``getSensorData`` devolvera pares angulo-distancia."""
         return self._is_range_data
@@ -772,17 +793,17 @@ class HokuyoSensorSim:
         self._is_range_data = bool(is_range_data)
 
     def getSensorData(self) -> np.ndarray:
-        """Le dados brutos dos sensores e devolve uma matriz NumPy.
+        """Le dados brutos dos sensores e devolve uma matriz NumPy de forma vetorizada.
 
         Returns:
             ``float[N, 2]`` de ``(angulo_rad, distancia_m)`` para modo range,
             ou ``float[N, 3]`` de pontos no referencial do laser. Ausencia de
             leituras retorna uma matriz vazia com numero de colunas correto.
         """
-        angulo = self._angle_min
-        dados: list[list[float]] = []
+        angulo_base = self._angle_min
+        blocos: list[np.ndarray] = []
 
-        for vision_sensor in self._vision_sensors_obj:
+        for idx, vision_sensor in enumerate(self._vision_sensors_obj):
             resposta = self._sim.readVisionSensor(vision_sensor)
             # A API remota pode retornar apenas o status inteiro enquanto o
             # vision sensor ainda nao publicou o pacote auxiliar.
@@ -795,40 +816,44 @@ class HokuyoSensorSim:
             if largura <= 0 or altura <= 0:
                 continue
 
-            transformacao_relativa = None
-            if not self._is_range_data:
-                matriz_sensor = self._sim.getObjectMatrix(vision_sensor)
-                matriz_base_inversa = self._sim.getMatrixInverse(
-                    self._sim.getObjectMatrix(self._base_obj)
-                )
-                transformacao_relativa = self._sim.multiplyMatrices(
-                    matriz_base_inversa, matriz_sensor
-                )
+            arr = np.asarray(pacote, dtype=float)
+            total_pontos = min(largura * altura, (len(arr) - 2) // 4)
+            if total_pontos <= 0:
+                continue
 
-            pontos_sensor: list[list[float]] = []
-            for linha in range(altura):
-                for coluna in range(largura):
-                    indice = 2 + 4 * (linha * largura + coluna)
-                    if indice + 3 >= len(pacote):
-                        continue
-                    leitura = pacote[indice : indice + 4]
-                    angulo += self._angle_increment
-                    if self._is_range_data:
-                        dados.append([angulo, float(leitura[3])])
-                    else:
-                        pontos_sensor.append(
-                            [float(leitura[0]), float(leitura[1]), float(leitura[2])]
-                        )
+            bloco = arr[2 : 2 + total_pontos * 4].reshape(total_pontos, 4)
 
-            if pontos_sensor:
-                assert transformacao_relativa is not None
-                matriz = np.asarray(transformacao_relativa, dtype=float).reshape(3, 4)
-                pontos = np.asarray(pontos_sensor, dtype=float)
-                pontos_no_laser = pontos @ matriz[:, :3].T + matriz[:, 3]
-                dados.extend(pontos_no_laser.tolist())
+            if self._is_range_data:
+                angulos = (
+                    angulo_base
+                    + np.arange(1, total_pontos + 1) * self._angle_increment
+                )
+                angulo_base = float(angulos[-1])
+                blocos.append(np.column_stack((angulos, bloco[:, 3])))
+            else:
+                matriz = (
+                    self._transformacoes_relativas[idx]
+                    if idx < len(self._transformacoes_relativas)
+                    else None
+                )
+                if matriz is None:
+                    matriz_sensor = self._sim.getObjectMatrix(vision_sensor)
+                    matriz_base_inversa = self._sim.getMatrixInverse(
+                        self._sim.getObjectMatrix(self._base_obj)
+                    )
+                    transformacao_relativa = self._sim.multiplyMatrices(
+                        matriz_base_inversa, matriz_sensor
+                    )
+                    matriz = np.asarray(transformacao_relativa, dtype=float).reshape(
+                        3, 4
+                    )
+                pontos_no_laser = bloco[:, :3] @ matriz[:, :3].T + matriz[:, 3]
+                blocos.append(pontos_no_laser)
 
         colunas = 2 if self._is_range_data else 3
-        return np.asarray(dados, dtype=float).reshape((-1, colunas))
+        if not blocos:
+            return np.empty((0, colunas), dtype=float)
+        return np.vstack(blocos)
 
 
 class Sensoriamento:
@@ -836,6 +861,7 @@ class Sensoriamento:
 
     def __init__(self) -> None:
         self._hokuyos: dict[tuple[int, str], HokuyoSensorSim] = {}
+        self._robot_handles: dict[tuple[int, str], int] = {}
 
     @staticmethod
     def _caminho_robo(robotname: str) -> str:
@@ -847,9 +873,15 @@ class Sensoriamento:
 
     def obter_pose(self, sim, robotname: str) -> tuple[float, float, float]:
         """Retorna pose mundial ``(x_m, y_m, theta_rad)`` do robo solicitado."""
-        handle = sim.getObject(self._caminho_robo(robotname))
-        if handle == -1:
-            raise ValueError(f"robo nao encontrado: {robotname}")
+        caminho = self._caminho_robo(robotname)
+        chave = (id(sim), caminho)
+        handle = self._robot_handles.get(chave)
+        if handle is None:
+            handle = sim.getObject(caminho)
+            if handle == -1:
+                raise ValueError(f"robo nao encontrado: {robotname}")
+            self._robot_handles[chave] = handle
+
         posicao = sim.getObjectPosition(handle, -1)
         orientacao = sim.getObjectOrientation(handle, -1)
         return float(posicao[0]), float(posicao[1]), float(orientacao[2])
@@ -1022,7 +1054,7 @@ class CamadaReativa:
         angulo_frontal_rad: float = math.radians(30.0),
         alcance_dinamico_m: float = 3.0,
         passos_persistencia: int = 3,
-        passos_expiracao: int = 15,
+        passos_expiracao: int = 45,
         janela_estagnacao_passos: int = 20,
         limiar_deslocamento_estagnacao_m: float = 0.05,
         limiar_angulo_estagnacao_rad: float = 0.20,
@@ -2344,21 +2376,13 @@ class Agent:
     VELOCIDADE_DESEJADA_M_S = 0.50
     LOOKAHEAD_M = 0.60
 
-    def __init__(self, id_robo: int, *, visualizar: bool = False):
-        """Inicializa o agente sem alterar a assinatura exigida pelo TP2.
-
-        Args:
-            id_robo: Identificador um-baseado recebido pelo servidor. O objeto
-                CoppeliaSim correspondente e ``PioneerP3DX[id_robo - 1]``.
-            visualizar: Se ``True``, abre janela em tempo real exibindo mapa D*,
-                visão ego local, vetores de força reativa e telemetria. Pode
-                também ser habilitado via variável de ambiente ``TP2_VISUALIZAR=1``
-                ou pelo método ``agente.habilitar_visualizacao()``.
-        """
+    def __init__(self, id_robo):
         self.id = id_robo
-        self.robotname = f"PioneerP3DX[{self.id - 1}]"
-        self.L = 0.381
-        self.r = 0.0975
+    
+        self.robotname = f'PioneerP3DX[{self.id - 1}]'
+
+        self.L = 0.381  # Metros
+        self.r = 0.0975 # Metros
 
         self._planejador: PlanejadorGlobal | None = None
         self._sensoriamento = Sensoriamento()
@@ -2375,6 +2399,7 @@ class Agent:
         self._indice_goal = 0
         self._goal_planejado: tuple[float, float] | None = None
         self._historico_trajetoria: list[tuple[float, float, float]] = []
+        self._motor_handles: dict[tuple[int, str], tuple[int, int]] = {}
 
         visualizar_env = os.environ.get("TP2_VISUALIZAR", "").strip().lower() in (
             "1",
@@ -2382,7 +2407,7 @@ class Agent:
             "yes",
             "on",
         )
-        self._visualizacao_ativa = bool(visualizar or visualizar_env)
+        self._visualizacao_ativa = visualizar_env
         self._visualizador: VisualizadorNavegacao | None = None
         if self._visualizacao_ativa:
             self.habilitar_visualizacao(True)
@@ -2430,10 +2455,6 @@ class Agent:
             return False
 
         goal_atual = goals[self._indice_goal]
-        if goal_atual != self._goal_planejado:
-            self._planejador.definir_goal(goal_atual)
-            self._goal_planejado = goal_atual
-
         pose = self._sensoriamento.obter_pose(sim, self.robotname)
         self._historico_trajetoria.append(pose)
 
@@ -2444,10 +2465,6 @@ class Agent:
             self._indice_goal += 1
             self._goal_planejado = None
             self._camada_reativa.resetar_recuperacao()
-            if self._indice_goal < len(goals):
-                proximo_goal = goals[self._indice_goal]
-                self._planejador.definir_goal(proximo_goal)
-                self._goal_planejado = proximo_goal
             if self._visualizacao_ativa and self._visualizador is not None:
                 self._visualizador.atualizar(
                     telemetria=self._camada_reativa.ultima_telemetria,
@@ -2457,6 +2474,10 @@ class Agent:
                     trajetoria=self._historico_trajetoria,
                 )
             return True
+
+        if goal_atual != self._goal_planejado:
+            self._planejador.definir_goal(goal_atual)
+            self._goal_planejado = goal_atual
 
         laser = self._sensoriamento.obter_laser(sim, self.robotname)
         self._camada_reativa.processar_obstaculos_dinamicos(
@@ -2551,38 +2572,23 @@ class Agent:
             goals.append((x, y))
         return tuple(goals)
 
-    @staticmethod
-    def _primeiro_waypoint_a_frente(
-        caminho: list[tuple[float, float]]
-    ) -> tuple[float, float] | None:
-        """Seleciona o proximo waypoint da rota global."""
-        if not caminho:
-            return None
-        return caminho[1] if len(caminho) > 1 else caminho[0]
-
-    def _vetor_para_waypoint(
-        self,
-        pose: tuple[float, float, float],
-        waypoint: tuple[float, float],
-    ) -> tuple[float, float] | None:
-        """Retorna vetor mundial de modulo controlado, ou None se nulo."""
-        delta_x = waypoint[0] - pose[0]
-        delta_y = waypoint[1] - pose[1]
-        norma = math.hypot(delta_x, delta_y)
-        if norma < 1e-12:
-            return None
-        escala = self.VELOCIDADE_DESEJADA_M_S / norma
-        return delta_x * escala, delta_y * escala
-
     def _parar_rodas(self, sim) -> None:
         """Envia velocidade zero aos dois motores do robo deste agente."""
         self._enviar_velocidades_roda(sim, 0.0, 0.0)
 
     def _enviar_velocidades_roda(self, sim, wl: float, wr: float) -> None:
         """Envia velocidades angulares aos motores esquerdo e direito."""
-        motor_esquerdo = sim.getObject(f"/{self.robotname}/leftMotor")
-        motor_direito = sim.getObject(f"/{self.robotname}/rightMotor")
-        if motor_esquerdo == -1 or motor_direito == -1:
-            raise ValueError(f"motores nao encontrados para {self.robotname}")
+        chave = (id(sim), self.robotname)
+        handles = self._motor_handles.get(chave)
+        if handles is None:
+            motor_esquerdo = sim.getObject(f"/{self.robotname}/leftMotor")
+            motor_direito = sim.getObject(f"/{self.robotname}/rightMotor")
+            if motor_esquerdo == -1 or motor_direito == -1:
+                raise ValueError(f"motores nao encontrados para {self.robotname}")
+            handles = (motor_esquerdo, motor_direito)
+            self._motor_handles[chave] = handles
+        else:
+            motor_esquerdo, motor_direito = handles
+
         sim.setJointTargetVelocity(motor_esquerdo, float(wl))
         sim.setJointTargetVelocity(motor_direito, float(wr))

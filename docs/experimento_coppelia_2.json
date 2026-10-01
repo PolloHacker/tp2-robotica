@@ -1,0 +1,40 @@
+{
+  "pose_inicial_solicitada": [
+    8.0,
+    -12.0,
+    1.5707963267948966
+  ],
+  "goals": [
+    [
+      -13.35,
+      11.95
+    ],
+    [
+      10.0,
+      -10.0
+    ]
+  ],
+  "tempo_final_s": 151.40000000000018,
+  "goals_alcancados": 2,
+  "chegadas": [
+    {
+      "goal": 1,
+      "tempo_s": 82.04999999999748,
+      "erro_m": 0.0784785799695821
+    },
+    {
+      "goal": 2,
+      "tempo_s": 151.40000000000018,
+      "erro_m": 0.09404197899480206
+    }
+  ],
+  "pose_final": [
+    9.959515397697604,
+    -9.91511837189547,
+    -1.1264283142622336
+  ],
+  "distancia_percorrida_m": 70.68091660426202,
+  "amostras": 3030,
+  "passos_recuperacao": 148,
+  "max_bloqueios_dinamicos": 17
+}

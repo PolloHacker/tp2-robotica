@@ -34,9 +34,39 @@ def gerar_goals_aleatorios_validos(planejador, pose_inicial, quantidade, *, seed
     """Sorteia goals livres, separados e alcancaveis no grid atual."""
     if quantidade < 0 or separacao_minima_m < 0:
         raise ValueError('quantidade e separacao_minima_m devem ser nao negativas')
+    if quantidade == 0:
+        return []
+    celula_inicial = planejador.mundo_para_celula(pose_inicial[:2])
+    if celula_inicial is None:
+        raise ValueError('a pose inicial deve estar dentro do mapa')
+    if planejador.ocupacao[celula_inicial]:
+        linha, coluna = celula_inicial
+        livres_proximas = [
+            (r, c)
+            for r in range(max(0, linha - 6), min(planejador.rows, linha + 7))
+            for c in range(max(0, coluna - 6), min(planejador.cols, coluna + 7))
+            if not planejador.ocupacao[r, c]
+        ]
+        if not livres_proximas:
+            raise ValueError('nao ha celula livre proxima da pose inicial')
+        celula_inicial = min(
+            livres_proximas,
+            key=lambda celula: math.dist(planejador.celula_para_mundo(celula), pose_inicial[:2]),
+        )
+
+    # Todos os goals no mesmo componente conexo sao alcancaveis. Uma busca
+    # evita reinicializar o D* Lite para cada candidato sorteado.
+    visitadas = {celula_inicial}
+    fila = [celula_inicial]
+    for celula in fila:
+        for vizinho in planejador._vizinhos(celula):
+            if vizinho not in visitadas and math.isfinite(planejador._custo(celula, vizinho)):
+                visitadas.add(vizinho)
+                fila.append(vizinho)
     candidatas = [
-        planejador.celula_para_mundo((linha, coluna))
+        planejador.celula_para_mundo((int(linha), int(coluna)))
         for linha, coluna in np.argwhere(~planejador.ocupacao)
+        if (int(linha), int(coluna)) in visitadas
     ]
     gerador = np.random.default_rng(seed)
     selecionadas = []
@@ -46,9 +76,7 @@ def gerar_goals_aleatorios_validos(planejador, pose_inicial, quantidade, *, seed
             continue
         if any(math.dist(candidata, outra) < separacao_minima_m for outra in selecionadas):
             continue
-        planejador.definir_goal(candidata)
-        if planejador.caminho_completo(pose_inicial):
-            selecionadas.append(candidata)
+        selecionadas.append(candidata)
         if len(selecionadas) == quantidade:
             return selecionadas
     raise ValueError('nao foi possivel gerar goals validos suficientes')
@@ -72,7 +100,7 @@ if TOLERANCIA_RASTRO_M <= 0:
 
 CAMINHO_MAPA = RAIZ / 'images' / 'tp2mapa.png'
 imagem = np.asarray(Image.open(CAMINHO_MAPA).convert('RGB'))
-agente = Agent(id_robo=1, visualizar=True)
+agente = Agent(id_robo=1)
 sensor = Sensoriamento()
 
 escala = (
@@ -170,6 +198,7 @@ handle_laser = sim.getObject(f'{caminho_robo}/fastHokuyo')
 leitor_laser_global = HokuyoSensorSim(
     sim, f'{caminho_robo}/fastHokuyo', is_range_data=False
 )
+T_R_L = matriz_coppelia_para_homogenea(sim.getObjectMatrix(handle_laser, handle_robo))
 goals = gerar_goals_aleatorios_validos(
     planejador_visual,
     pose_inicial,
@@ -232,7 +261,7 @@ plotar_execucao(
     pose_inicial=pose_inicial,
     rotas_planejadas=rotas_planejadas,
 )
-plt.show()
+plt.show(block=False)
 
 trajetoria: list[tuple[float, float, float]] = [pose_inicial]
 pontos_laser_mundo: list[list[float]] = []
@@ -257,7 +286,6 @@ def registrar_varredura_global() -> int:
     pontos_laser = pontos_laser[np.isfinite(distancias) & (distancias > 0.0) & (distancias < 4.9)]
     if len(pontos_laser) == 0:
         return 0
-    T_R_L = matriz_coppelia_para_homogenea(sim.getObjectMatrix(handle_laser, handle_robo))
     T_W_R = matriz_coppelia_para_homogenea(sim.getObjectMatrix(handle_robo, sim.handle_world))
     pontos_novos = transformar_pontos_laser_para_mundo(pontos_laser, T_R_L, T_W_R)
     pontos_laser_mundo.extend(pontos_novos.tolist())
@@ -268,15 +296,19 @@ try:
     sim.startSimulation()
     simulacao_iniciada = True
 
-    while sim.getSimulationTime() < DURACAO_MAXIMA_S:
+    while True:
+        tempo_atual = float(sim.getSimulationTime())
+        if tempo_atual >= DURACAO_MAXIMA_S:
+            break
+
         pose_atual = sensor.obter_pose(sim, agente.robotname)
         if passos % AMOSTRA_A_CADA_PASSOS == 0:
             trajetoria.append(pose_atual)
-            historico_tempos.append(float(sim.getSimulationTime()))
+            historico_tempos.append(tempo_atual)
             historico_celulas_bloqueadas.append(len(agente._camada_reativa._celulas_bloqueadas))
             if agente._camada_reativa._estado_recuperacao != CamadaReativa.ESTADO_NORMAL:
                 passos_recuperacao_total += 1
-        tempo_atual = float(sim.getSimulationTime())
+
         if tempo_atual - ultimo_tempo_laser >= PERIODO_LASER_S:
             registrar_varredura_global()
             ultimo_tempo_laser = tempo_atual
@@ -298,7 +330,7 @@ try:
                 [goal_alcancado[0], goal_alcancado[1], ALTURA_DESENHO_M],
             )
             quantidade_alcancada += 1
-            print(f'Goal {quantidade_alcancada}/{len(goals)} alcançado em t={sim.getSimulationTime():.2f} s')
+            print(f'Goal {quantidade_alcancada}/{len(goals)} alcançado em t={tempo_atual:.2f} s')
             if quantidade_alcancada == len(goals):
                 break
 
@@ -337,7 +369,7 @@ fig, ax = plotar_execucao(
     trajetoria=trajetoria,
     quantidade_alcancada=quantidade_alcancada,
 )
-plt.show()
+plt.show(block=False)
 
 pontos_xy = np.asarray([(x, y) for x, y, _ in trajetoria])
 distancia_percorrida_m = float(np.linalg.norm(np.diff(pontos_xy, axis=0), axis=1).sum()) if len(pontos_xy) > 1 else 0.0
@@ -460,7 +492,7 @@ fig_reativo, _ = plotar_diagnostico_camada_reativa(
     historico_tempos=historico_tempos,
     historico_bloqueios=historico_celulas_bloqueadas,
 )
-plt.show()
+plt.show(block=False)
 
 display(Markdown(
     "**Análise da camada reativa (Pessoa B):** O gráfico da esquerda demonstra a combinação instantânea "
@@ -509,7 +541,7 @@ def plotar_mapa_global_percebido(
 fig_laser, ax_laser, quantidade_pontos_laser = plotar_mapa_global_percebido(
     pontos_laser_mundo, trajetoria
 )
-plt.show()
+plt.show(block=False)
 display(Markdown(
     f'**Leitura global desta execução.** Foram acumulados **{quantidade_pontos_laser}** pontos válidos do Hokuyo. '
     'Pontos fora do alcance útil de 4,9 m, ausentes ou não finitos foram descartados; '
